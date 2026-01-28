@@ -10,6 +10,9 @@ resolver = "2"
 paca-cli = { path = "./paca-cli" }
 paca-core = { path = "./paca-core" }
 
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
 [workspace.package]
 authors = ["synchronal.dev"]
 description = "Helpers for interacting with llama.cpp"

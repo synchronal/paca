@@ -10,7 +10,13 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "paca"
+path = "src/main.rs"
+
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
 
 [features]
 strict = [] # Treat warnings as a build error.
