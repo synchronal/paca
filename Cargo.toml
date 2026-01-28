@@ -1,0 +1,23 @@
+[workspace]
+members = [
+  'paca-cli',
+  'paca-core',
+]
+resolver = "2"
+
+
+[workspace.dependencies]
+paca-cli = { path = "./paca-cli" }
+paca-core = { path = "./paca-core" }
+
+[workspace.package]
+authors = ["synchronal.dev"]
+description = "Helpers for interacting with llama.cpp"
+edition = "2024"
+homepage = "https://github.com/synchronal"
+license = "MIT"
+readme = "./README.md"
+repository = "https://github.com/synchronal/paca"
+rust-version = "1.89"
+version = "0.1.0"
+
