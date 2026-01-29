@@ -3,10 +3,14 @@ use std::str::FromStr;
 
 use crate::error::ModelRefError;
 
+/// Represents a model reference in the format owner/model:tag
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelRef {
+    /// The model identifier within the repository
     pub model: String,
+    /// The repository owner on HuggingFace
     pub owner: String,
+    /// The specific tag/version of the model
     pub tag: String,
 }
 
@@ -32,6 +36,7 @@ impl fmt::Display for ModelRef {
 }
 
 impl ModelRef {
+    /// Returns the repository identifier (owner/model)
     pub fn repo(&self) -> String {
         format!("{}/{}", self.owner, self.model)
     }

@@ -16,8 +16,11 @@ use endpoint::get_model_endpoint;
 use manifest::{fetch_manifest, manifest_filename};
 use model_ref::ModelRef;
 
+/// User agent string used for HTTP requests
 pub(crate) const USER_AGENT: &str = "llama-cpp";
 
+/// Downloads a GGUF model from HuggingFace with support for resumable downloads
+/// and incremental updates using ETag validation
 pub fn download_model(
     model: &str,
     cache_dir: Option<PathBuf>,
@@ -244,5 +247,17 @@ mod tests {
     fn etag_matches_returns_false_when_no_etag_file() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!etag_matches(dir.path(), "model.gguf", "\"abc123\""));
+    }
+
+    #[test]
+    fn etag_matches_returns_false_when_etag_file_corrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let filename = "model.gguf";
+        let etag_path = dir.path().join(format!("{}.etag", filename));
+
+        // Write invalid JSON to the etag file
+        fs::write(&etag_path, "[invalid json").unwrap();
+
+        assert!(!etag_matches(dir.path(), filename, "\"abc123\""));
     }
 }

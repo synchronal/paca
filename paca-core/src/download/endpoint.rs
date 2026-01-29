@@ -1,7 +1,10 @@
 use std::env;
 
+/// Default HuggingFace endpoint URL
 const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 
+/// Gets the model endpoint from environment variables
+/// Prefers MODEL_ENDPOINT over HF_ENDPOINT, falls back to default
 pub fn get_model_endpoint() -> String {
     env::var("MODEL_ENDPOINT")
         .or_else(|_| env::var("HF_ENDPOINT"))

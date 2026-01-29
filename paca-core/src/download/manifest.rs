@@ -27,16 +27,21 @@ struct TreeEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GgufFile {
+    /// The filename of the GGUF file
     pub filename: String,
+    /// The size of the file in bytes
     pub size: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
+    /// List of GGUF files to download
     pub gguf_files: Vec<GgufFile>,
+    /// Raw JSON response from HuggingFace
     pub raw_json: String,
 }
 
+/// Fetches the model manifest from HuggingFace, handling both single and sharded files
 pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
     let endpoint = get_model_endpoint();
     let url = format!(
@@ -73,6 +78,7 @@ pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest,
     })
 }
 
+/// Fetches sharded GGUF files from the HuggingFace tree API
 fn fetch_tree_files(
     client: &Client,
     endpoint: &str,
@@ -116,6 +122,7 @@ fn shard_count(filename: &str) -> Option<usize> {
     of_part.1.parse::<usize>().ok()
 }
 
+/// Generates a unique filename for the model manifest
 pub fn manifest_filename(model_ref: &ModelRef) -> String {
     format!(
         "manifest={}={}={}.json",

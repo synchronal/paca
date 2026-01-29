@@ -3,6 +3,7 @@
 pub mod cli;
 use cli::Cli;
 
+/// Executes the command-line interface logic
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Download(args) => {

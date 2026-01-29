@@ -3,6 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Command-line interface for the llama.cpp model downloader
 #[derive(Parser, Debug)]
 #[command(name = "paca")]
 #[command(author, version, about = "Helpers for interacting with llama.cpp", long_about = None)]
