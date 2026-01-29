@@ -1,6 +1,6 @@
 #![cfg_attr(feature = "strict", deny(warnings))]
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "paca")]
@@ -10,8 +10,16 @@ pub struct Cli {
     pub command: Commands,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, PartialEq, Subcommand)]
 pub enum Commands {
+    /// Download a model from HuggingFace
+    Download(ModelArgs),
     /// Print version information
     Version,
+}
+
+#[derive(Args, Debug, PartialEq)]
+pub struct ModelArgs {
+    /// Model identifier (e.g., unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL)
+    pub model: String,
 }

@@ -6,6 +6,10 @@ use cli::Cli;
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        cli::Commands::Download(args) => {
+            let path = paca_core::download::download_model(&args.model)?;
+            println!("{}", path.display());
+        }
         cli::Commands::Version => {
             println!("paca {}", env!("CARGO_PKG_VERSION"));
         }
@@ -16,6 +20,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    use crate::cli::ModelArgs;
 
     use super::*;
 
@@ -33,5 +39,24 @@ mod tests {
         assert!(result.is_ok());
         let cli = result.unwrap();
         assert!(matches!(cli.command, cli::Commands::Version));
+    }
+
+    #[test]
+    fn cli_parses_download_subcommand() {
+        let result = Cli::try_parse_from(["paca", "download", "owner/model:tag"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Download(ModelArgs {
+                model: String::from("owner/model:tag")
+            })
+        );
+    }
+
+    #[test]
+    fn cli_download_requires_model_argument() {
+        let result = Cli::try_parse_from(["paca", "download"]);
+        assert!(result.is_err());
     }
 }

@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+paca-core.workspace = true
 
 [features]
 strict = [] # Treat warnings as a build error.
