@@ -6,7 +6,7 @@ pub use crate::error::DownloadError;
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
@@ -16,9 +16,14 @@ use endpoint::get_model_endpoint;
 use manifest::{fetch_manifest, manifest_filename};
 use model_ref::ModelRef;
 
+pub(crate) const USER_AGENT: &str = "llama-cpp";
+
 pub fn download_model(model: &str) -> Result<Vec<PathBuf>, DownloadError> {
-    let model_ref = ModelRef::parse(model)?;
-    let manifest = fetch_manifest(&model_ref)?;
+    let model_ref: ModelRef = model.parse()?;
+    let client = Client::new();
+    let etag_client = Client::builder().redirect(Policy::none()).build()?;
+
+    let manifest = fetch_manifest(&client, &model_ref)?;
     let cache_dir = get_cache_dir()?;
     let endpoint = get_model_endpoint();
 
@@ -35,7 +40,7 @@ pub fn download_model(model: &str) -> Result<Vec<PathBuf>, DownloadError> {
             gguf_file.filename
         );
 
-        let remote_etag = fetch_etag(&url)?;
+        let remote_etag = fetch_etag(&etag_client, &url)?;
 
         if file_path.exists() && etag_matches(&cache_dir, &filename, &remote_etag) {
             let existing_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
@@ -45,10 +50,10 @@ pub fn download_model(model: &str) -> Result<Vec<PathBuf>, DownloadError> {
                 continue;
             }
 
-            download_file(&url, &file_path, existing_size)?;
+            download_file(&client, &url, &file_path, existing_size)?;
         } else {
             save_etag(&cache_dir, &filename, &remote_etag)?;
-            download_file(&url, &file_path, 0)?;
+            download_file(&client, &url, &file_path, 0)?;
         }
 
         paths.push(file_path);
@@ -65,7 +70,7 @@ fn cache_filename(model_ref: &ModelRef, gguf_file: &str) -> String {
 }
 
 fn save_manifest(
-    cache_dir: &std::path::Path,
+    cache_dir: &Path,
     model_ref: &ModelRef,
     raw_json: &str,
 ) -> Result<(), DownloadError> {
@@ -74,10 +79,8 @@ fn save_manifest(
     Ok(())
 }
 
-fn fetch_etag(url: &str) -> Result<String, DownloadError> {
-    let client = Client::builder().redirect(Policy::none()).build()?;
-
-    let response = client.head(url).header("User-Agent", "llama-cpp").send()?;
+fn fetch_etag(client: &Client, url: &str) -> Result<String, DownloadError> {
+    let response = client.head(url).header("User-Agent", USER_AGENT).send()?;
 
     let etag = response
         .headers()
@@ -89,14 +92,14 @@ fn fetch_etag(url: &str) -> Result<String, DownloadError> {
     Ok(etag)
 }
 
-fn etag_matches(cache_dir: &std::path::Path, filename: &str, remote_etag: &str) -> bool {
+fn etag_matches(cache_dir: &Path, filename: &str, remote_etag: &str) -> bool {
     let etag_path = cache_dir.join(format!("{}.etag", filename));
     fs::read_to_string(etag_path)
         .map(|local_etag| local_etag == remote_etag)
         .unwrap_or(false)
 }
 
-fn save_etag(cache_dir: &std::path::Path, filename: &str, etag: &str) -> Result<(), DownloadError> {
+fn save_etag(cache_dir: &Path, filename: &str, etag: &str) -> Result<(), DownloadError> {
     let etag_path = cache_dir.join(format!("{}.etag", filename));
     fs::write(&etag_path, etag).map_err(DownloadError::FileWrite)?;
     Ok(())
@@ -117,9 +120,13 @@ fn get_cache_dir() -> Result<PathBuf, DownloadError> {
     Ok(cache_dir)
 }
 
-fn download_file(url: &str, path: &PathBuf, resume_from: u64) -> Result<(), DownloadError> {
-    let client = Client::new();
-    let mut request = client.get(url).header("User-Agent", "llama-cpp");
+fn download_file(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    resume_from: u64,
+) -> Result<(), DownloadError> {
+    let mut request = client.get(url).header("User-Agent", USER_AGENT);
 
     if resume_from > 0 {
         request = request.header("Range", format!("bytes={}-", resume_from));
@@ -187,7 +194,7 @@ mod tests {
 
     #[test]
     fn cache_filename_flattens_simple_gguf_file() {
-        let model_ref = ModelRef::parse("unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL").unwrap();
+        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL".parse().unwrap();
         let filename = cache_filename(&model_ref, "GLM-4.7-Flash-UD-Q2_K_XL.gguf");
         assert_eq!(
             filename,
@@ -197,7 +204,7 @@ mod tests {
 
     #[test]
     fn cache_filename_flattens_subdirectory_gguf_file() {
-        let model_ref = ModelRef::parse("unsloth/GLM-4.7-Flash-GGUF:BF16").unwrap();
+        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:BF16".parse().unwrap();
         let filename = cache_filename(&model_ref, "BF16/GLM-4.7-Flash-BF16-00001-of-00002.gguf");
         assert_eq!(
             filename,

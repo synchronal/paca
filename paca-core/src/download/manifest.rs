@@ -3,6 +3,7 @@ use serde::Deserialize;
 
 use crate::error::DownloadError;
 
+use super::USER_AGENT;
 use super::endpoint::get_model_endpoint;
 use super::model_ref::ModelRef;
 
@@ -24,19 +25,19 @@ struct TreeEntry {
     size: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GgufFile {
     pub filename: String,
     pub size: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
     pub gguf_files: Vec<GgufFile>,
     pub raw_json: String,
 }
 
-pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
+pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
     let endpoint = get_model_endpoint();
     let url = format!(
         "{}/v2/{}/manifests/{}",
@@ -45,10 +46,9 @@ pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
         model_ref.tag
     );
 
-    let client = Client::new();
     let response = client
         .get(&url)
-        .header("User-Agent", "llama-cpp")
+        .header("User-Agent", USER_AGENT)
         .send()?
         .error_for_status()?;
 
@@ -60,7 +60,7 @@ pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
         .ok_or(DownloadError::NoGgufFile)?;
 
     let gguf_files = match shard_count(&gguf_file_info.rfilename) {
-        Some(_) => fetch_tree_files(&endpoint, model_ref, &gguf_file_info.rfilename)?,
+        Some(_) => fetch_tree_files(client, &endpoint, model_ref, &gguf_file_info.rfilename)?,
         None => vec![GgufFile {
             filename: gguf_file_info.rfilename,
             size: gguf_file_info.size,
@@ -74,6 +74,7 @@ pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
 }
 
 fn fetch_tree_files(
+    client: &Client,
     endpoint: &str,
     model_ref: &ModelRef,
     rfilename: &str,
@@ -87,10 +88,9 @@ fn fetch_tree_files(
         subdir
     );
 
-    let client = Client::new();
     let response = client
         .get(&url)
-        .header("User-Agent", "llama-cpp")
+        .header("User-Agent", USER_AGENT)
         .send()?
         .error_for_status()?;
 
@@ -105,7 +105,7 @@ fn fetch_tree_files(
         })
         .collect();
 
-    gguf_files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    gguf_files.sort_by_key(|file| file.filename.clone());
 
     Ok(gguf_files)
 }
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn manifest_filename_formats_correctly() {
-        let model_ref = ModelRef::parse("unsloth/GLM-4.7-Flash-GGUF:BF16").unwrap();
+        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:BF16".parse().unwrap();
         let filename = manifest_filename(&model_ref);
         assert_eq!(filename, "manifest=unsloth=GLM-4.7-Flash-GGUF=BF16.json");
     }
