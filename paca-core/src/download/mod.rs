@@ -33,13 +33,21 @@ pub fn download_model(model: &str) -> Result<PathBuf, DownloadError> {
     );
 
     let remote_etag = fetch_etag(&url)?;
+    let expected_size = manifest.size;
 
     if file_path.exists() && etag_matches(&cache_dir, &filename, &remote_etag) {
-        return Ok(file_path);
+        let existing_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+
+        if existing_size >= expected_size {
+            return Ok(file_path);
+        }
+
+        download_file(&url, &file_path, existing_size)?;
+    } else {
+        save_etag(&cache_dir, &filename, &remote_etag)?;
+        download_file(&url, &file_path, 0)?;
     }
 
-    save_etag(&cache_dir, &filename, &remote_etag)?;
-    download_file(&url, &file_path)?;
     save_manifest(&cache_dir, &model_ref, &manifest.raw_json)?;
 
     Ok(file_path)
@@ -103,17 +111,32 @@ fn get_cache_dir() -> Result<PathBuf, DownloadError> {
     Ok(cache_dir)
 }
 
-fn download_file(url: &str, path: &PathBuf) -> Result<(), DownloadError> {
+fn download_file(url: &str, path: &PathBuf, resume_from: u64) -> Result<(), DownloadError> {
     let client = Client::new();
-    let mut response = client
-        .get(url)
-        .header("User-Agent", "llama-cpp")
-        .send()?
-        .error_for_status()?;
+    let mut request = client.get(url).header("User-Agent", "llama-cpp");
 
-    let total_size = response.content_length().unwrap_or(0);
+    if resume_from > 0 {
+        request = request.header("Range", format!("bytes={}-", resume_from));
+    }
+
+    let mut response = request.send()?.error_for_status()?;
+
+    let is_partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+
+    let (mut file, start_pos) = if is_partial {
+        let file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(DownloadError::FileWrite)?;
+        (file, resume_from)
+    } else {
+        (File::create(path).map_err(DownloadError::FileWrite)?, 0)
+    };
+
+    let total_size = response.content_length().unwrap_or(0) + start_pos;
 
     let progress_bar = ProgressBar::new(total_size);
+    progress_bar.set_position(start_pos);
     progress_bar.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
@@ -121,7 +144,6 @@ fn download_file(url: &str, path: &PathBuf) -> Result<(), DownloadError> {
             .progress_chars("#>-"),
     );
 
-    let mut file = File::create(path).map_err(DownloadError::FileWrite)?;
     let mut buffer = [0u8; 8192];
 
     loop {

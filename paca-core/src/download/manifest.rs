@@ -15,12 +15,14 @@ struct ManifestResponse {
 #[derive(Debug, Deserialize)]
 struct GgufFileInfo {
     rfilename: String,
+    size: u64,
 }
 
 #[derive(Debug)]
 pub struct Manifest {
     pub gguf_file: String,
     pub raw_json: String,
+    pub size: u64,
 }
 
 pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
@@ -49,6 +51,7 @@ pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
     Ok(Manifest {
         gguf_file: gguf_file_info.rfilename,
         raw_json,
+        size: gguf_file_info.size,
     })
 }
 
@@ -68,9 +71,11 @@ mod tests {
         let manifest = Manifest {
             gguf_file: "model.gguf".to_string(),
             raw_json: "{}".to_string(),
+            size: 1024,
         };
         assert_eq!(manifest.gguf_file, "model.gguf");
         assert_eq!(manifest.raw_json, "{}");
+        assert_eq!(manifest.size, 1024);
     }
 
     #[test]
