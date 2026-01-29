@@ -1,13 +1,12 @@
 #![cfg_attr(feature = "strict", deny(warnings))]
 
 pub mod cli;
-
 use cli::Cli;
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Download(args) => {
-            let paths = paca_core::download::download_model(&args.model)?;
+            let paths = paca_core::download::download_model(&args.model, args.cache_dir)?;
             for path in &paths {
                 println!("{}", path.display());
             }
@@ -21,11 +20,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
-    use crate::cli::ModelArgs;
-
     use super::*;
+    use crate::cli::ModelArgs;
+    use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn cli_parses_help() {
@@ -51,7 +49,28 @@ mod tests {
         assert_eq!(
             cli.command,
             cli::Commands::Download(ModelArgs {
-                model: String::from("owner/model:tag")
+                cache_dir: None,
+                model: String::from("owner/model:tag"),
+            })
+        );
+    }
+
+    #[test]
+    fn cli_parses_download_with_cache_dir() {
+        let result = Cli::try_parse_from([
+            "paca",
+            "download",
+            "--cache-dir",
+            "/tmp/models",
+            "owner/model:tag",
+        ]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Download(ModelArgs {
+                cache_dir: Some(PathBuf::from("/tmp/models")),
+                model: String::from("owner/model:tag"),
             })
         );
     }

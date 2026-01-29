@@ -18,13 +18,22 @@ use model_ref::ModelRef;
 
 pub(crate) const USER_AGENT: &str = "llama-cpp";
 
-pub fn download_model(model: &str) -> Result<Vec<PathBuf>, DownloadError> {
+pub fn download_model(
+    model: &str,
+    cache_dir: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, DownloadError> {
     let model_ref: ModelRef = model.parse()?;
     let client = Client::new();
     let etag_client = Client::builder().redirect(Policy::none()).build()?;
 
     let manifest = fetch_manifest(&client, &model_ref)?;
-    let cache_dir = get_cache_dir()?;
+    let cache_dir = match cache_dir {
+        Some(dir) => {
+            fs::create_dir_all(&dir).map_err(DownloadError::CacheDir)?;
+            dir
+        }
+        None => get_cache_dir()?,
+    };
     let endpoint = get_model_endpoint();
 
     let mut paths = Vec::new();
@@ -188,7 +197,7 @@ mod tests {
 
     #[test]
     fn download_model_returns_error_for_missing_tag() {
-        let result = download_model("owner/model");
+        let result = download_model("owner/model", None);
         assert!(result.is_err());
     }
 

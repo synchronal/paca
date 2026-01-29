@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "strict", deny(warnings))]
 
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "paca")]
@@ -20,6 +21,10 @@ pub enum Commands {
 
 #[derive(Args, Debug, PartialEq)]
 pub struct ModelArgs {
+    /// Override the cache directory for downloaded files
+    #[arg(long)]
+    pub cache_dir: Option<PathBuf>,
+
     /// Model identifier (e.g., unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL)
     pub model: String,
 }
