@@ -16,41 +16,47 @@ use endpoint::get_model_endpoint;
 use manifest::{fetch_manifest, manifest_filename};
 use model_ref::ModelRef;
 
-pub fn download_model(model: &str) -> Result<PathBuf, DownloadError> {
+pub fn download_model(model: &str) -> Result<Vec<PathBuf>, DownloadError> {
     let model_ref = ModelRef::parse(model)?;
     let manifest = fetch_manifest(&model_ref)?;
-
     let cache_dir = get_cache_dir()?;
-    let filename = cache_filename(&model_ref, &manifest.gguf_file);
-    let file_path = cache_dir.join(&filename);
-
     let endpoint = get_model_endpoint();
-    let url = format!(
-        "{}/{}/resolve/main/{}",
-        endpoint,
-        model_ref.repo(),
-        manifest.gguf_file
-    );
 
-    let remote_etag = fetch_etag(&url)?;
-    let expected_size = manifest.size;
+    let mut paths = Vec::new();
 
-    if file_path.exists() && etag_matches(&cache_dir, &filename, &remote_etag) {
-        let existing_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+    for gguf_file in &manifest.gguf_files {
+        let filename = cache_filename(&model_ref, &gguf_file.filename);
+        let file_path = cache_dir.join(&filename);
 
-        if existing_size >= expected_size {
-            return Ok(file_path);
+        let url = format!(
+            "{}/{}/resolve/main/{}",
+            endpoint,
+            model_ref.repo(),
+            gguf_file.filename
+        );
+
+        let remote_etag = fetch_etag(&url)?;
+
+        if file_path.exists() && etag_matches(&cache_dir, &filename, &remote_etag) {
+            let existing_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+
+            if existing_size >= gguf_file.size {
+                paths.push(file_path);
+                continue;
+            }
+
+            download_file(&url, &file_path, existing_size)?;
+        } else {
+            save_etag(&cache_dir, &filename, &remote_etag)?;
+            download_file(&url, &file_path, 0)?;
         }
 
-        download_file(&url, &file_path, existing_size)?;
-    } else {
-        save_etag(&cache_dir, &filename, &remote_etag)?;
-        download_file(&url, &file_path, 0)?;
+        paths.push(file_path);
     }
 
     save_manifest(&cache_dir, &model_ref, &manifest.raw_json)?;
 
-    Ok(file_path)
+    Ok(paths)
 }
 
 fn cache_filename(model_ref: &ModelRef, gguf_file: &str) -> String {

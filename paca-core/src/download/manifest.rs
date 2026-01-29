@@ -18,11 +18,22 @@ struct GgufFileInfo {
     size: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct TreeEntry {
+    path: String,
+    size: u64,
+}
+
+#[derive(Debug)]
+pub struct GgufFile {
+    pub filename: String,
+    pub size: u64,
+}
+
 #[derive(Debug)]
 pub struct Manifest {
-    pub gguf_file: String,
+    pub gguf_files: Vec<GgufFile>,
     pub raw_json: String,
-    pub size: u64,
 }
 
 pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
@@ -48,11 +59,61 @@ pub fn fetch_manifest(model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
         .gguf_file
         .ok_or(DownloadError::NoGgufFile)?;
 
+    let gguf_files = match shard_count(&gguf_file_info.rfilename) {
+        Some(_) => fetch_tree_files(&endpoint, model_ref, &gguf_file_info.rfilename)?,
+        None => vec![GgufFile {
+            filename: gguf_file_info.rfilename,
+            size: gguf_file_info.size,
+        }],
+    };
+
     Ok(Manifest {
-        gguf_file: gguf_file_info.rfilename,
+        gguf_files,
         raw_json,
-        size: gguf_file_info.size,
     })
+}
+
+fn fetch_tree_files(
+    endpoint: &str,
+    model_ref: &ModelRef,
+    rfilename: &str,
+) -> Result<Vec<GgufFile>, DownloadError> {
+    let subdir = rfilename.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+
+    let url = format!(
+        "{}/api/models/{}/tree/main/{}",
+        endpoint,
+        model_ref.repo(),
+        subdir
+    );
+
+    let client = Client::new();
+    let response = client
+        .get(&url)
+        .header("User-Agent", "llama-cpp")
+        .send()?
+        .error_for_status()?;
+
+    let entries: Vec<TreeEntry> = response.json()?;
+
+    let mut gguf_files: Vec<GgufFile> = entries
+        .into_iter()
+        .filter(|entry| entry.path.ends_with(".gguf"))
+        .map(|entry| GgufFile {
+            filename: entry.path,
+            size: entry.size,
+        })
+        .collect();
+
+    gguf_files.sort_by(|a, b| a.filename.cmp(&b.filename));
+
+    Ok(gguf_files)
+}
+
+fn shard_count(filename: &str) -> Option<usize> {
+    let stem = filename.strip_suffix(".gguf")?;
+    let of_part = stem.rsplit_once("-of-")?;
+    of_part.1.parse::<usize>().ok()
 }
 
 pub fn manifest_filename(model_ref: &ModelRef) -> String {
@@ -67,15 +128,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_struct_holds_required_fields() {
+    fn manifest_struct_holds_single_file() {
         let manifest = Manifest {
-            gguf_file: "model.gguf".to_string(),
+            gguf_files: vec![GgufFile {
+                filename: "model.gguf".to_string(),
+                size: 1024,
+            }],
             raw_json: "{}".to_string(),
-            size: 1024,
         };
-        assert_eq!(manifest.gguf_file, "model.gguf");
-        assert_eq!(manifest.raw_json, "{}");
-        assert_eq!(manifest.size, 1024);
+        assert_eq!(manifest.gguf_files.len(), 1);
+        assert_eq!(manifest.gguf_files[0].filename, "model.gguf");
+        assert_eq!(manifest.gguf_files[0].size, 1024);
+    }
+
+    #[test]
+    fn manifest_struct_holds_multiple_files() {
+        let manifest = Manifest {
+            gguf_files: vec![
+                GgufFile {
+                    filename: "file-00001-of-00002.gguf".to_string(),
+                    size: 1024,
+                },
+                GgufFile {
+                    filename: "file-00002-of-00002.gguf".to_string(),
+                    size: 2048,
+                },
+            ],
+            raw_json: "{}".to_string(),
+        };
+        assert_eq!(manifest.gguf_files.len(), 2);
+        assert_eq!(manifest.gguf_files[0].filename, "file-00001-of-00002.gguf");
+        assert_eq!(manifest.gguf_files[1].filename, "file-00002-of-00002.gguf");
     }
 
     #[test]
@@ -83,5 +166,28 @@ mod tests {
         let model_ref = ModelRef::parse("unsloth/GLM-4.7-Flash-GGUF:BF16").unwrap();
         let filename = manifest_filename(&model_ref);
         assert_eq!(filename, "manifest=unsloth=GLM-4.7-Flash-GGUF=BF16.json");
+    }
+
+    #[test]
+    fn shard_count_returns_none_for_single_file() {
+        assert_eq!(shard_count("model.gguf"), None);
+    }
+
+    #[test]
+    fn shard_count_returns_none_for_single_file_with_directory() {
+        assert_eq!(shard_count("Q4_K_M/model-Q4_K_M.gguf"), None);
+    }
+
+    #[test]
+    fn shard_count_returns_total_for_sharded_file() {
+        assert_eq!(
+            shard_count("BF16/GLM-4.7-BF16-00001-of-00015.gguf"),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn shard_count_returns_total_for_two_shards() {
+        assert_eq!(shard_count("BF16/Model-BF16-00001-of-00002.gguf"), Some(2));
     }
 }

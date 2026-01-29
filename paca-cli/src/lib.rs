@@ -7,8 +7,10 @@ use cli::Cli;
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Download(args) => {
-            let path = paca_core::download::download_model(&args.model)?;
-            println!("{}", path.display());
+            let paths = paca_core::download::download_model(&args.model)?;
+            for path in &paths {
+                println!("{}", path.display());
+            }
         }
         cli::Commands::Version => {
             println!("paca {}", env!("CARGO_PKG_VERSION"));
