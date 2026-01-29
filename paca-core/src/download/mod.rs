@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
+use reqwest::redirect::Policy;
 
 use endpoint::get_model_endpoint;
 use manifest::{fetch_manifest, manifest_filename};
@@ -20,11 +21,8 @@ pub fn download_model(model: &str) -> Result<PathBuf, DownloadError> {
     let manifest = fetch_manifest(&model_ref)?;
 
     let cache_dir = get_cache_dir()?;
-    let file_path = cache_dir.join(&manifest.gguf_file);
-
-    if file_path.exists() {
-        return Ok(file_path);
-    }
+    let filename = cache_filename(&model_ref, &manifest.gguf_file);
+    let file_path = cache_dir.join(&filename);
 
     let endpoint = get_model_endpoint();
     let url = format!(
@@ -34,10 +32,22 @@ pub fn download_model(model: &str) -> Result<PathBuf, DownloadError> {
         manifest.gguf_file
     );
 
+    let remote_etag = fetch_etag(&url)?;
+
+    if file_path.exists() && etag_matches(&cache_dir, &filename, &remote_etag) {
+        return Ok(file_path);
+    }
+
+    save_etag(&cache_dir, &filename, &remote_etag)?;
     download_file(&url, &file_path)?;
     save_manifest(&cache_dir, &model_ref, &manifest.raw_json)?;
 
     Ok(file_path)
+}
+
+fn cache_filename(model_ref: &ModelRef, gguf_file: &str) -> String {
+    let flat_gguf = gguf_file.replace('/', "_");
+    format!("{}_{}_{}", model_ref.owner, model_ref.model, flat_gguf)
 }
 
 fn save_manifest(
@@ -47,6 +57,34 @@ fn save_manifest(
 ) -> Result<(), DownloadError> {
     let manifest_path = cache_dir.join(manifest_filename(model_ref));
     fs::write(&manifest_path, raw_json).map_err(DownloadError::FileWrite)?;
+    Ok(())
+}
+
+fn fetch_etag(url: &str) -> Result<String, DownloadError> {
+    let client = Client::builder().redirect(Policy::none()).build()?;
+
+    let response = client.head(url).header("User-Agent", "llama-cpp").send()?;
+
+    let etag = response
+        .headers()
+        .get("x-linked-etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(etag)
+}
+
+fn etag_matches(cache_dir: &std::path::Path, filename: &str, remote_etag: &str) -> bool {
+    let etag_path = cache_dir.join(format!("{}.etag", filename));
+    fs::read_to_string(etag_path)
+        .map(|local_etag| local_etag == remote_etag)
+        .unwrap_or(false)
+}
+
+fn save_etag(cache_dir: &std::path::Path, filename: &str, etag: &str) -> Result<(), DownloadError> {
+    let etag_path = cache_dir.join(format!("{}.etag", filename));
+    fs::write(&etag_path, etag).map_err(DownloadError::FileWrite)?;
     Ok(())
 }
 
@@ -117,5 +155,50 @@ mod tests {
     fn download_model_returns_error_for_missing_tag() {
         let result = download_model("owner/model");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cache_filename_flattens_simple_gguf_file() {
+        let model_ref = ModelRef::parse("unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL").unwrap();
+        let filename = cache_filename(&model_ref, "GLM-4.7-Flash-UD-Q2_K_XL.gguf");
+        assert_eq!(
+            filename,
+            "unsloth_GLM-4.7-Flash-GGUF_GLM-4.7-Flash-UD-Q2_K_XL.gguf"
+        );
+    }
+
+    #[test]
+    fn cache_filename_flattens_subdirectory_gguf_file() {
+        let model_ref = ModelRef::parse("unsloth/GLM-4.7-Flash-GGUF:BF16").unwrap();
+        let filename = cache_filename(&model_ref, "BF16/GLM-4.7-Flash-BF16-00001-of-00002.gguf");
+        assert_eq!(
+            filename,
+            "unsloth_GLM-4.7-Flash-GGUF_BF16_GLM-4.7-Flash-BF16-00001-of-00002.gguf"
+        );
+    }
+
+    #[test]
+    fn etag_matches_returns_true_when_etag_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let filename = "model.gguf";
+        let etag = "\"abc123\"";
+
+        save_etag(dir.path(), filename, etag).unwrap();
+        assert!(etag_matches(dir.path(), filename, etag));
+    }
+
+    #[test]
+    fn etag_matches_returns_false_when_etag_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let filename = "model.gguf";
+
+        save_etag(dir.path(), filename, "\"old\"").unwrap();
+        assert!(!etag_matches(dir.path(), filename, "\"new\""));
+    }
+
+    #[test]
+    fn etag_matches_returns_false_when_no_etag_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!etag_matches(dir.path(), "model.gguf", "\"abc123\""));
     }
 }
