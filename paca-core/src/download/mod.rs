@@ -4,12 +4,14 @@ mod model_ref;
 
 pub use crate::error::DownloadError;
 
+use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
+use reqwest::header::HeaderMap;
 use reqwest::redirect::Policy;
 
 use endpoint::get_model_endpoint;
@@ -17,7 +19,21 @@ use manifest::{fetch_manifest, manifest_filename};
 use model_ref::ModelRef;
 
 /// User agent string used for HTTP requests
-pub(crate) const USER_AGENT: &str = "llama-cpp";
+const USER_AGENT: &str = "llama-cpp";
+
+fn default_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("User-Agent", USER_AGENT.parse().unwrap());
+
+    if let Ok(token) = env::var("HF_TOKEN") {
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+    }
+
+    headers
+}
 
 /// Downloads a GGUF model from HuggingFace with support for resumable downloads
 /// and incremental updates using ETag validation
@@ -26,8 +42,12 @@ pub fn download_model(
     cache_dir: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>, DownloadError> {
     let model_ref: ModelRef = model.parse()?;
-    let client = Client::new();
-    let etag_client = Client::builder().redirect(Policy::none()).build()?;
+    let headers = default_headers();
+    let client = Client::builder().default_headers(headers.clone()).build()?;
+    let etag_client = Client::builder()
+        .default_headers(headers)
+        .redirect(Policy::none())
+        .build()?;
 
     let manifest = fetch_manifest(&client, &model_ref)?;
     let cache_dir = match cache_dir {
@@ -92,7 +112,7 @@ fn save_manifest(
 }
 
 fn fetch_etag(client: &Client, url: &str) -> Result<String, DownloadError> {
-    let response = client.head(url).header("User-Agent", USER_AGENT).send()?;
+    let response = client.head(url).send()?;
 
     let etag = response
         .headers()
@@ -138,7 +158,7 @@ fn download_file(
     path: &Path,
     resume_from: u64,
 ) -> Result<(), DownloadError> {
-    let mut request = client.get(url).header("User-Agent", USER_AGENT);
+    let mut request = client.get(url);
 
     if resume_from > 0 {
         request = request.header("Range", format!("bytes={}-", resume_from));
@@ -191,6 +211,36 @@ fn download_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_headers_includes_authorization_when_hf_token_set() {
+        temp_env::with_vars([("HF_TOKEN", Some("test-token-123"))], || {
+            let headers = default_headers();
+            assert_eq!(
+                headers.get("Authorization").unwrap().to_str().unwrap(),
+                "Bearer test-token-123"
+            );
+        });
+    }
+
+    #[test]
+    fn default_headers_excludes_authorization_when_hf_token_unset() {
+        temp_env::with_vars_unset(["HF_TOKEN"], || {
+            let headers = default_headers();
+            assert!(headers.get("Authorization").is_none());
+        });
+    }
+
+    #[test]
+    fn default_headers_includes_user_agent() {
+        temp_env::with_vars_unset(["HF_TOKEN"], || {
+            let headers = default_headers();
+            assert_eq!(
+                headers.get("User-Agent").unwrap().to_str().unwrap(),
+                "llama-cpp"
+            );
+        });
+    }
 
     #[test]
     fn get_cache_dir_returns_llama_cpp_subdirectory() {

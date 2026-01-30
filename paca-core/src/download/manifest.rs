@@ -3,7 +3,6 @@ use serde::Deserialize;
 
 use crate::error::DownloadError;
 
-use super::USER_AGENT;
 use super::endpoint::get_model_endpoint;
 use super::model_ref::ModelRef;
 
@@ -51,11 +50,7 @@ pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest,
         model_ref.tag
     );
 
-    let response = client
-        .get(&url)
-        .header("User-Agent", USER_AGENT)
-        .send()?
-        .error_for_status()?;
+    let response = client.get(&url).send()?.error_for_status()?;
 
     let raw_json = response.text()?;
     let manifest_response: ManifestResponse = serde_json::from_str(&raw_json)?;
@@ -94,11 +89,7 @@ fn fetch_tree_files(
         subdir
     );
 
-    let response = client
-        .get(&url)
-        .header("User-Agent", USER_AGENT)
-        .send()?
-        .error_for_status()?;
+    let response = client.get(&url).send()?.error_for_status()?;
 
     let entries: Vec<TreeEntry> = response.json()?;
 
