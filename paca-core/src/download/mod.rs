@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use reqwest::header::HeaderMap;
-use reqwest::redirect::Policy;
 
 use endpoint::get_model_endpoint;
 use manifest::{fetch_manifest, manifest_filename};
@@ -43,11 +42,7 @@ pub fn download_model(
 ) -> Result<Vec<PathBuf>, DownloadError> {
     let model_ref: ModelRef = model.parse()?;
     let headers = default_headers();
-    let client = Client::builder().default_headers(headers.clone()).build()?;
-    let etag_client = Client::builder()
-        .default_headers(headers)
-        .redirect(Policy::none())
-        .build()?;
+    let client = Client::builder().default_headers(headers).build()?;
 
     let manifest = fetch_manifest(&client, &model_ref)?;
     let cache_dir = match cache_dir {
@@ -72,9 +67,13 @@ pub fn download_model(
             gguf_file.filename
         );
 
-        let remote_etag = fetch_etag(&etag_client, &url)?;
+        let remote_etag = fetch_etag(&client, &url)?;
 
-        if file_path.exists() && etag_matches(&cache_dir, &filename, &remote_etag) {
+        if !etag_matches(&cache_dir, &filename, &remote_etag) {
+            save_etag(&cache_dir, &filename, &remote_etag)?;
+        }
+
+        if file_path.exists() {
             let existing_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
             if existing_size >= gguf_file.size {
@@ -84,7 +83,6 @@ pub fn download_model(
 
             download_file(&client, &url, &file_path, existing_size)?;
         } else {
-            save_etag(&cache_dir, &filename, &remote_etag)?;
             download_file(&client, &url, &file_path, 0)?;
         }
 
@@ -116,7 +114,7 @@ fn fetch_etag(client: &Client, url: &str) -> Result<String, DownloadError> {
 
     let etag = response
         .headers()
-        .get("x-linked-etag")
+        .get("etag")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
