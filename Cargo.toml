@@ -13,8 +13,8 @@ paca-core = { path = "./paca-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
-indicatif = "0.17"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+indicatif = "0.18"
+reqwest = { version = "0.13", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 temp-env = "0.3"
