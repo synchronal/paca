@@ -6,7 +6,7 @@ pub use crate::error::DownloadError;
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -171,9 +171,12 @@ fn download_file(
             .append(true)
             .open(path)
             .map_err(DownloadError::FileWrite)?;
-        (file, resume_from)
+        (BufWriter::new(file), resume_from)
     } else {
-        (File::create(path).map_err(DownloadError::FileWrite)?, 0)
+        (
+            BufWriter::new(File::create(path).map_err(DownloadError::FileWrite)?),
+            0,
+        )
     };
 
     let total_size = response.content_length().unwrap_or(0) + start_pos;
@@ -187,7 +190,7 @@ fn download_file(
             .progress_chars("#>-"),
     );
 
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; 131072];
 
     loop {
         let bytes_read = response
