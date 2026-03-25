@@ -1,3 +1,5 @@
+use std::fmt;
+
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
@@ -32,6 +34,30 @@ pub struct GgufFile {
     pub size: u64,
 }
 
+impl fmt::Display for GgufFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.filename)
+    }
+}
+
+impl From<GgufFileInfo> for GgufFile {
+    fn from(info: GgufFileInfo) -> Self {
+        Self {
+            filename: info.rfilename,
+            size: info.size,
+        }
+    }
+}
+
+impl From<TreeEntry> for GgufFile {
+    fn from(entry: TreeEntry) -> Self {
+        Self {
+            filename: entry.path,
+            size: entry.size,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
     /// List of GGUF files to download
@@ -61,10 +87,7 @@ pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest,
 
     let gguf_files = match shard_count(&gguf_file_info.rfilename) {
         Some(_) => fetch_tree_files(client, &endpoint, model_ref, &gguf_file_info.rfilename)?,
-        None => vec![GgufFile {
-            filename: gguf_file_info.rfilename,
-            size: gguf_file_info.size,
-        }],
+        None => vec![gguf_file_info.into()],
     };
 
     Ok(Manifest {
@@ -96,10 +119,7 @@ fn fetch_tree_files(
     let mut gguf_files: Vec<GgufFile> = entries
         .into_iter()
         .filter(|entry| entry.path.ends_with(".gguf"))
-        .map(|entry| GgufFile {
-            filename: entry.path,
-            size: entry.size,
-        })
+        .map(GgufFile::from)
         .collect();
 
     gguf_files.sort_by_key(|file| file.filename.clone());
@@ -187,5 +207,36 @@ mod tests {
     #[test]
     fn shard_count_returns_total_for_two_shards() {
         assert_eq!(shard_count("BF16/Model-BF16-00001-of-00002.gguf"), Some(2));
+    }
+
+    #[test]
+    fn gguf_file_displays_filename() {
+        let file = GgufFile {
+            filename: "model-Q4_K_M.gguf".to_string(),
+            size: 4096,
+        };
+        assert_eq!(file.to_string(), "model-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn gguf_file_from_gguf_file_info() {
+        let info = GgufFileInfo {
+            rfilename: "model-Q4_K_M.gguf".to_string(),
+            size: 4096,
+        };
+        let file = GgufFile::from(info);
+        assert_eq!(file.filename, "model-Q4_K_M.gguf");
+        assert_eq!(file.size, 4096);
+    }
+
+    #[test]
+    fn gguf_file_from_tree_entry() {
+        let entry = TreeEntry {
+            path: "BF16/model-00001-of-00002.gguf".to_string(),
+            size: 2048,
+        };
+        let file = GgufFile::from(entry);
+        assert_eq!(file.filename, "BF16/model-00001-of-00002.gguf");
+        assert_eq!(file.size, 2048);
     }
 }
