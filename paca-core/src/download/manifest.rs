@@ -122,7 +122,7 @@ fn fetch_tree_files(
         .map(GgufFile::from)
         .collect();
 
-    gguf_files.sort_by_key(|file| file.filename.clone());
+    gguf_files.sort_by(|a, b| a.filename.cmp(&b.filename));
 
     Ok(gguf_files)
 }
