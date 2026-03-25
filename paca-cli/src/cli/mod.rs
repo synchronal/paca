@@ -16,8 +16,18 @@ pub struct Cli {
 pub enum Commands {
     /// Download a model from HuggingFace
     Download(ModelArgs),
+    /// List all downloaded models
+    #[command(aliases = ["ls"])]
+    List(ListArgs),
     /// Print version information
     Version,
+}
+
+#[derive(Args, Debug, PartialEq)]
+pub struct ListArgs {
+    /// Override the cache directory for listing models
+    #[arg(long)]
+    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, PartialEq)]

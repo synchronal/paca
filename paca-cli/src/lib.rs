@@ -15,6 +15,16 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         cli::Commands::Version => {
             println!("paca {}", env!("CARGO_PKG_VERSION"));
         }
+        cli::Commands::List(args) => {
+            let models = paca_core::download::list_models(args.cache_dir)?;
+            if models.is_empty() {
+                println!("No downloaded models found.");
+            } else {
+                for model in &models {
+                    println!("{}", model.model_ref);
+                }
+            }
+        }
     }
     Ok(())
 }

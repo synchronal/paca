@@ -26,6 +26,21 @@ pub enum DownloadError {
     /// Invalid model reference format
     #[error("{0}")]
     ModelRef(#[from] ModelRefError),
+
+    /// Invalid path format
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
+}
+
+impl From<std::io::Error> for DownloadError {
+    fn from(err: std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                DownloadError::InvalidPath(format!("File not found: {}", err))
+            }
+            _ => DownloadError::CacheDir(err),
+        }
+    }
 }
 
 /// Errors that can occur while parsing model references

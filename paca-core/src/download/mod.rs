@@ -17,6 +17,15 @@ use endpoint::get_model_endpoint;
 use manifest::{fetch_manifest, manifest_filename};
 use model_ref::ModelRef;
 
+/// Information about a downloaded model
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ModelInfo {
+    /// The model reference (owner/model:tag)
+    pub model_ref: ModelRef,
+    /// Whether the model is installed
+    pub installed: bool,
+}
+
 /// User agent string used for HTTP requests
 const USER_AGENT: &str = "llama-cpp";
 
@@ -207,6 +216,78 @@ fn download_file(
     progress_bar.finish_with_message("Download complete");
 
     Ok(())
+}
+
+/// Lists all downloaded models from the cache directory
+pub fn list_models(cache_dir: Option<PathBuf>) -> Result<Vec<ModelInfo>, DownloadError> {
+    let cache_dir = match cache_dir {
+        Some(dir) => dir,
+        None => get_cache_dir()?,
+    };
+
+    if !cache_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut models = Vec::new();
+
+    for entry in fs::read_dir(&cache_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file()
+            && path.extension().is_some_and(|ext| ext == "json")
+            && let Ok(manifest) = parse_model_manifest(&path)
+        {
+            models.push(manifest);
+        }
+    }
+
+    models.sort_by(|a, b| a.model_ref.to_string().cmp(&b.model_ref.to_string()));
+
+    Ok(models)
+}
+
+/// Parses a model manifest file and returns model information
+fn parse_model_manifest(path: &Path) -> Result<ModelInfo, DownloadError> {
+    let content = fs::read_to_string(path)?;
+    let _json: serde_json::Value = serde_json::from_str(&content)?;
+
+    let model_ref = extract_model_ref(path)?;
+
+    Ok(ModelInfo {
+        model_ref,
+        installed: true,
+    })
+}
+
+/// Extracts the model reference from a manifest filename
+fn extract_model_ref(manifest_path: &Path) -> Result<ModelRef, DownloadError> {
+    let filename = manifest_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| DownloadError::InvalidPath("Invalid filename".to_string()))?;
+
+    let parts: Vec<&str> = filename
+        .strip_prefix("manifest=")
+        .unwrap_or(filename)
+        .split('=')
+        .collect();
+
+    if parts.len() != 3 {
+        return Err(DownloadError::InvalidPath(
+            "Invalid manifest filename format".to_string(),
+        ));
+    }
+
+    let owner = parts[0].to_string();
+    let model = parts[1].to_string();
+    let tag = parts[2]
+        .strip_suffix(".json")
+        .unwrap_or(parts[2])
+        .to_string();
+
+    Ok(ModelRef { owner, model, tag })
 }
 
 #[cfg(test)]
