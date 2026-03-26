@@ -123,6 +123,7 @@ fn download_file(
         progress_bar.inc(bytes_read as u64);
     }
 
+    file.flush().map_err(PacaError::FileWrite)?;
     progress_bar.finish_with_message("Download complete");
 
     Ok(())
