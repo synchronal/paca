@@ -6,6 +6,16 @@ use cli::Cli;
 /// Executes the command-line interface logic
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        cli::Commands::Clean(args) => {
+            let result = paca_core::cache::clean::clean_cache(args.cache_dir)?;
+            if result.removed_files.is_empty() {
+                println!("Cache is clean.");
+            } else {
+                for file in &result.removed_files {
+                    println!("{}", file.path.display());
+                }
+            }
+        }
         cli::Commands::Download(args) => {
             let paths = paca_core::download::download_model(&args.model, args.cache_dir)?;
             for path in &paths {
@@ -45,6 +55,30 @@ mod tests {
     use crate::cli::ModelArgs;
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn cli_parses_clean_subcommand() {
+        let result = Cli::try_parse_from(["paca", "clean"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Clean(cli::CommonArgs { cache_dir: None })
+        );
+    }
+
+    #[test]
+    fn cli_parses_clean_with_cache_dir() {
+        let result = Cli::try_parse_from(["paca", "clean", "--cache-dir", "/tmp/models"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Clean(cli::CommonArgs {
+                cache_dir: Some(PathBuf::from("/tmp/models")),
+            })
+        );
+    }
 
     #[test]
     fn cli_parses_help() {

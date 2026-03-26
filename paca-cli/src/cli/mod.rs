@@ -14,6 +14,8 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum Commands {
+    /// Remove stale files from the cache
+    Clean(CommonArgs),
     /// Download a model from HuggingFace
     Download(ModelArgs),
     /// List all downloaded models

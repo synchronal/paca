@@ -1,3 +1,5 @@
+pub mod clean;
+
 pub use crate::error::PacaError;
 
 use std::fs;

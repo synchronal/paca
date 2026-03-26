@@ -23,6 +23,10 @@ pub enum PacaError {
     #[error("Failed to download file: {0}")]
     Download(std::io::Error),
 
+    /// Failed to delete a file from the cache
+    #[error("Failed to delete file: {0}")]
+    FileDelete(std::io::Error),
+
     /// Failed to write downloaded files to disk
     #[error("Failed to write file: {0}")]
     FileWrite(std::io::Error),
