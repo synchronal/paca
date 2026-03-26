@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 
 use crate::cache::{cache_filename, etag_matches, get_cache_dir, save_etag, save_manifest};
@@ -33,7 +33,19 @@ pub fn download_model(model: &str, cache_dir: Option<PathBuf>) -> Result<Vec<Pat
 
     let mut paths = Vec::new();
 
-    for gguf_file in &manifest.gguf_files {
+    let multi = MultiProgress::new();
+    let bars: Vec<ProgressBar> = manifest
+        .gguf_files
+        .iter()
+        .map(|gguf_file| {
+            let bar = multi.add(ProgressBar::new(gguf_file.size));
+            bar.set_style(pending_style());
+            bar.set_message(gguf_file.filename.clone());
+            bar
+        })
+        .collect();
+
+    for (gguf_file, bar) in manifest.gguf_files.iter().zip(bars) {
         let filename = cache_filename(&model_ref, &gguf_file.filename);
         let file_path = cache_dir.join(&filename);
 
@@ -54,13 +66,16 @@ pub fn download_model(model: &str, cache_dir: Option<PathBuf>) -> Result<Vec<Pat
             let existing_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
             if existing_size >= gguf_file.size {
+                bar.set_style(download_style());
+                bar.set_position(gguf_file.size);
+                bar.finish();
                 paths.push(file_path);
                 continue;
             }
 
-            download_file(&client, &url, &file_path, existing_size)?;
+            download_file(&client, &url, &file_path, existing_size, &bar)?;
         } else {
-            download_file(&client, &url, &file_path, 0)?;
+            download_file(&client, &url, &file_path, 0, &bar)?;
         }
 
         paths.push(file_path);
@@ -76,6 +91,7 @@ fn download_file(
     url: &str,
     path: &Path,
     resume_from: u64,
+    progress_bar: &ProgressBar,
 ) -> Result<(), PacaError> {
     let mut request = client.get(url);
 
@@ -100,16 +116,8 @@ fn download_file(
         )
     };
 
-    let total_size = response.content_length().unwrap_or(0) + start_pos;
-
-    let progress_bar = ProgressBar::new(total_size);
+    progress_bar.set_style(download_style());
     progress_bar.set_position(start_pos);
-    progress_bar.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
 
     let mut buffer = [0u8; 131072];
 
@@ -124,9 +132,20 @@ fn download_file(
     }
 
     file.flush().map_err(PacaError::FileWrite)?;
-    progress_bar.finish_with_message("Download complete");
+    progress_bar.finish();
 
     Ok(())
+}
+
+fn pending_style() -> ProgressStyle {
+    ProgressStyle::default_bar().template("{msg}").unwrap()
+}
+
+fn download_style() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
+        .unwrap()
+        .progress_chars("#>-")
 }
 
 #[cfg(test)]
