@@ -31,10 +31,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("All downloaded models are up to date.");
             } else {
                 for model in &outdated {
-                    println!("{}", model.model_ref);
-                    println!("  {}", model.filename);
-                    println!("  {}", model.file_path.display());
-                    println!();
+                    println!("{}  {}", model.model_ref, model.filename);
                 }
             }
         }
