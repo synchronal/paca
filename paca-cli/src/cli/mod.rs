@@ -18,13 +18,15 @@ pub enum Commands {
     Download(ModelArgs),
     /// List all downloaded models
     #[command(aliases = ["ls"])]
-    List(ListArgs),
+    List(CommonArgs),
+    /// Check which downloaded models have outdated files
+    Outdated(CommonArgs),
     /// Print version information
     Version,
 }
 
 #[derive(Args, Debug, PartialEq)]
-pub struct ListArgs {
+pub struct CommonArgs {
     /// Override the cache directory for listing models
     #[arg(long)]
     pub cache_dir: Option<PathBuf>,

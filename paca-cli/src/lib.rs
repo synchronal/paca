@@ -25,6 +25,19 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        cli::Commands::Outdated(args) => {
+            let outdated = paca_core::download::check_outdated_models(args.cache_dir)?;
+            if outdated.is_empty() {
+                println!("All downloaded models are up to date.");
+            } else {
+                for model in &outdated {
+                    println!("{}", model.model_ref);
+                    println!("  {}", model.filename);
+                    println!("  {}", model.file_path.display());
+                    println!();
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -87,8 +100,29 @@ mod tests {
     }
 
     #[test]
-    fn cli_download_requires_model_argument() {
+    fn cli_parses_download_requires_model_argument() {
         let result = Cli::try_parse_from(["paca", "download"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_outdated_subcommand() {
+        let result = Cli::try_parse_from(["paca", "outdated"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert!(matches!(cli.command, cli::Commands::Outdated(_)));
+    }
+
+    #[test]
+    fn cli_parses_outdated_with_cache_dir() {
+        let result = Cli::try_parse_from(["paca", "outdated", "--cache-dir", "/tmp/models"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Outdated(cli::CommonArgs {
+                cache_dir: Some(PathBuf::from("/tmp/models")),
+            })
+        );
     }
 }

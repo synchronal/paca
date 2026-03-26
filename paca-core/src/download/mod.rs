@@ -281,6 +281,76 @@ fn extract_model_ref(manifest_path: &Path) -> Result<ModelRef, PacaError> {
     Ok(ModelRef { owner, model, tag })
 }
 
+/// Checks which downloaded models have outdated files
+pub fn check_outdated_models(
+    cache_dir: Option<PathBuf>,
+) -> Result<Vec<OutdatedModelInfo>, PacaError> {
+    let cache_dir = match cache_dir {
+        Some(dir) => dir,
+        None => get_cache_dir()?,
+    };
+
+    if !cache_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let client = Client::builder()
+        .default_headers(default_headers())
+        .build()?;
+    let endpoint = get_model_endpoint();
+    let mut outdated_models = Vec::new();
+
+    for entry in fs::read_dir(&cache_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file()
+            && path.extension().is_some_and(|ext| ext == "json")
+            && let Ok(model_ref) = extract_model_ref(&path)
+        {
+            let manifest = fetch_manifest(&client, &model_ref)?;
+
+            for gguf_file in &manifest.gguf_files {
+                let filename = cache_filename(&model_ref, &gguf_file.filename);
+                let file_path = cache_dir.join(&filename);
+                let url = format!(
+                    "{}/{}/resolve/main/{}",
+                    endpoint,
+                    model_ref.repo(),
+                    gguf_file.filename
+                );
+
+                let remote_etag = fetch_etag(&client, &url);
+
+                if let Ok(remote_etag) = remote_etag
+                    && !etag_matches(&cache_dir, &filename, &remote_etag)
+                {
+                    outdated_models.push(OutdatedModelInfo {
+                        model_ref: model_ref.clone(),
+                        filename: gguf_file.filename.clone(),
+                        file_path,
+                    });
+                }
+            }
+        }
+    }
+
+    outdated_models.sort_by(|a, b| a.model_ref.to_string().cmp(&b.model_ref.to_string()));
+
+    Ok(outdated_models)
+}
+
+/// Information about a model file with an outdated etag
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct OutdatedModelInfo {
+    /// The model reference (owner/model:tag)
+    pub model_ref: ModelRef,
+    /// The filename of the outdated file
+    pub filename: String,
+    /// The local file path
+    pub file_path: PathBuf,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
