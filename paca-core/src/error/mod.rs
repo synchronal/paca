@@ -19,6 +19,10 @@ pub enum PacaError {
     #[error("Failed to create cache directory: {0}")]
     CacheDir(std::io::Error),
 
+    /// Failed to read response body during download
+    #[error("Failed to download file: {0}")]
+    Download(std::io::Error),
+
     /// Failed to write downloaded files to disk
     #[error("Failed to write file: {0}")]
     FileWrite(std::io::Error),

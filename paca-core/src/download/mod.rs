@@ -114,7 +114,7 @@ fn download_file(
     let mut buffer = [0u8; 131072];
 
     loop {
-        let bytes_read = response.read(&mut buffer).map_err(PacaError::FileWrite)?;
+        let bytes_read = response.read(&mut buffer).map_err(PacaError::Download)?;
         if bytes_read == 0 {
             break;
         }
