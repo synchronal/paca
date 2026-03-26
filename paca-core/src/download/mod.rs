@@ -3,6 +3,8 @@ pub use crate::error::PacaError;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
@@ -136,7 +138,61 @@ fn create_snapshot_symlink(
     Ok(symlink_path)
 }
 
+const MAX_RETRIES: u32 = 5;
+
 fn download_file(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    resume_from: u64,
+    progress_bar: &ProgressBar,
+) -> Result<(), PacaError> {
+    let mut retries: u32 = 0;
+    let mut bytes_on_disk = resume_from;
+
+    loop {
+        match attempt_download(client, url, path, bytes_on_disk, progress_bar) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_retryable(&e) => {
+                let new_size = fs::metadata(path).map(|m| m.len()).unwrap_or(bytes_on_disk);
+
+                if new_size > bytes_on_disk {
+                    retries = 0;
+                    bytes_on_disk = new_size;
+                } else {
+                    retries += 1;
+                }
+
+                if retries > MAX_RETRIES {
+                    return Err(e);
+                }
+
+                let delay_secs = 1u64 << retries;
+                progress_bar.println(format!(
+                    "Download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
+                ));
+                thread::sleep(Duration::from_secs(delay_secs));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_retryable(error: &PacaError) -> bool {
+    match error {
+        PacaError::Download(_) => true,
+        PacaError::ManifestFetch(e) => {
+            if let Some(status) = e.status() {
+                status.is_server_error()
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+fn attempt_download(
     client: &Client,
     url: &str,
     path: &Path,
@@ -172,13 +228,18 @@ fn download_file(
     let mut buffer = [0u8; 131072];
 
     loop {
-        let bytes_read = response.read(&mut buffer).map_err(PacaError::Download)?;
-        if bytes_read == 0 {
-            break;
+        match response.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                file.write_all(&buffer[..bytes_read])
+                    .map_err(PacaError::FileWrite)?;
+                progress_bar.inc(bytes_read as u64);
+            }
+            Err(e) => {
+                let _ = file.flush();
+                return Err(PacaError::Download(e));
+            }
         }
-        file.write_all(&buffer[..bytes_read])
-            .map_err(PacaError::FileWrite)?;
-        progress_bar.inc(bytes_read as u64);
     }
 
     file.flush().map_err(PacaError::FileWrite)?;
