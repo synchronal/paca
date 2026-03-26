@@ -4,9 +4,8 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 
 use crate::error::PacaError;
-
-use super::endpoint::get_model_endpoint;
-use super::model_ref::ModelRef;
+use crate::model::ModelRef;
+use crate::registry::endpoint::get_model_endpoint;
 
 #[derive(Debug, Deserialize)]
 struct ManifestResponse {

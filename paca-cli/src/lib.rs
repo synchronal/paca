@@ -16,7 +16,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             println!("paca {}", env!("CARGO_PKG_VERSION"));
         }
         cli::Commands::List(args) => {
-            let models = paca_core::download::list_models(args.cache_dir)?;
+            let models = paca_core::cache::list_models(args.cache_dir)?;
             if models.is_empty() {
                 println!("No downloaded models found.");
             } else {
@@ -26,7 +26,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Outdated(args) => {
-            let outdated = paca_core::download::check_outdated_models(args.cache_dir)?;
+            let outdated = paca_core::cache::check_outdated_models(args.cache_dir)?;
             if outdated.is_empty() {
                 println!("All downloaded models are up to date.");
             } else {
