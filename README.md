@@ -16,3 +16,11 @@ Paca provides a `download` subcommand for this purpose.
 ``` shell
 paca download unsloth/GLM-4.7-GGUF:BF16
 ```
+
+## List
+
+List all downloaded models.
+
+``` shell
+paca list
+```
