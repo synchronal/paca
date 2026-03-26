@@ -11,9 +11,9 @@ pub enum PacaError {
     #[error("Failed to parse manifest: {0}")]
     ManifestParse(#[from] serde_json::Error),
 
-    /// No GGUF file found in the model manifest
-    #[error("No GGUF file found in manifest")]
-    NoGgufFile,
+    /// No downloadable files found in the model manifest
+    #[error("No downloadable files found in manifest")]
+    NoFiles,
 
     /// Failed to create or access the cache directory
     #[error("Failed to create cache directory: {0}")]
@@ -31,6 +31,14 @@ pub enum PacaError {
     #[error("Failed to write file: {0}")]
     FileWrite(std::io::Error),
 
+    /// Missing blob hash (ETag) from registry response
+    #[error("Missing blob hash (ETag) for: {0}")]
+    MissingBlobHash(String),
+
+    /// Missing commit hash from registry response
+    #[error("Missing x-repo-commit header for: {0}")]
+    MissingCommitHash(String),
+
     /// Invalid model reference format
     #[error("{0}")]
     ModelRef(#[from] ModelRefError),
@@ -38,6 +46,10 @@ pub enum PacaError {
     /// Invalid path format
     #[error("Invalid path: {0}")]
     InvalidPath(String),
+
+    /// Failed to create a symlink
+    #[error("Failed to create symlink: {0}")]
+    Symlink(std::io::Error),
 }
 
 impl From<std::io::Error> for PacaError {

@@ -8,18 +8,6 @@ use crate::model::ModelRef;
 use crate::registry::endpoint::get_model_endpoint;
 
 #[derive(Debug, Deserialize)]
-struct ManifestResponse {
-    #[serde(rename = "ggufFile")]
-    gguf_file: Option<GgufFileInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GgufFileInfo {
-    rfilename: String,
-    size: u64,
-}
-
-#[derive(Debug, Deserialize)]
 struct TreeEntry {
     path: String,
     size: u64,
@@ -39,15 +27,6 @@ impl fmt::Display for GgufFile {
     }
 }
 
-impl From<GgufFileInfo> for GgufFile {
-    fn from(info: GgufFileInfo) -> Self {
-        Self {
-            filename: info.rfilename,
-            size: info.size,
-        }
-    }
-}
-
 impl From<TreeEntry> for GgufFile {
     fn from(entry: TreeEntry) -> Self {
         Self {
@@ -61,8 +40,6 @@ impl From<TreeEntry> for GgufFile {
 pub struct Manifest {
     /// List of GGUF files to download
     pub gguf_files: Vec<GgufFile>,
-    /// Raw JSON response from HuggingFace
-    pub raw_json: String,
 }
 
 /// Fetches the model manifest from HuggingFace, handling both single and sharded files
@@ -77,20 +54,57 @@ pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest,
 
     let response = client.get(&url).send()?.error_for_status()?;
 
-    let raw_json = response.text()?;
-    let manifest_response: ManifestResponse = serde_json::from_str(&raw_json)?;
+    let parsed: serde_json::Value = response.json()?;
+    let discovered = collect_manifest_files(&parsed);
 
-    let gguf_file_info = manifest_response.gguf_file.ok_or(PacaError::NoGgufFile)?;
+    if discovered.is_empty() {
+        return Err(PacaError::NoFiles);
+    }
 
-    let gguf_files = match shard_count(&gguf_file_info.rfilename) {
-        Some(_) => fetch_tree_files(client, &endpoint, model_ref, &gguf_file_info.rfilename)?,
-        None => vec![gguf_file_info.into()],
+    let mut gguf_files = Vec::new();
+    for file in discovered {
+        match shard_count(&file.filename) {
+            Some(_) => {
+                gguf_files.extend(fetch_tree_files(
+                    client,
+                    &endpoint,
+                    model_ref,
+                    &file.filename,
+                )?);
+            }
+            None => gguf_files.push(file),
+        }
+    }
+
+    Ok(Manifest { gguf_files })
+}
+
+/// Walks top-level JSON entries and collects any object with `rfilename` (String) + `size` (u64)
+fn collect_manifest_files(value: &serde_json::Value) -> Vec<GgufFile> {
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
     };
 
-    Ok(Manifest {
-        gguf_files,
-        raw_json,
-    })
+    let mut files: Vec<GgufFile> = Vec::new();
+
+    for (_key, entry) in obj {
+        let Some(entry_obj) = entry.as_object() else {
+            continue;
+        };
+
+        let rfilename = entry_obj
+            .get("rfilename")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let size = entry_obj.get("size").and_then(|v| v.as_u64());
+
+        if let (Some(filename), Some(size)) = (rfilename, size) {
+            files.push(GgufFile { filename, size });
+        }
+    }
+
+    files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    files
 }
 
 /// Fetches sharded GGUF files from the HuggingFace tree API
@@ -130,14 +144,6 @@ fn shard_count(filename: &str) -> Option<usize> {
     of_part.1.parse::<usize>().ok()
 }
 
-/// Generates a unique filename for the model manifest
-pub fn manifest_filename(model_ref: &ModelRef) -> String {
-    format!(
-        "manifest={}={}={}.json",
-        model_ref.owner, model_ref.model, model_ref.tag
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,7 +155,6 @@ mod tests {
                 filename: "model.gguf".to_string(),
                 size: 1024,
             }],
-            raw_json: "{}".to_string(),
         };
         assert_eq!(manifest.gguf_files.len(), 1);
         assert_eq!(manifest.gguf_files[0].filename, "model.gguf");
@@ -169,18 +174,10 @@ mod tests {
                     size: 2048,
                 },
             ],
-            raw_json: "{}".to_string(),
         };
         assert_eq!(manifest.gguf_files.len(), 2);
         assert_eq!(manifest.gguf_files[0].filename, "file-00001-of-00002.gguf");
         assert_eq!(manifest.gguf_files[1].filename, "file-00002-of-00002.gguf");
-    }
-
-    #[test]
-    fn manifest_filename_formats_correctly() {
-        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:BF16".parse().unwrap();
-        let filename = manifest_filename(&model_ref);
-        assert_eq!(filename, "manifest=unsloth=GLM-4.7-Flash-GGUF=BF16.json");
     }
 
     #[test]
@@ -216,14 +213,70 @@ mod tests {
     }
 
     #[test]
-    fn gguf_file_from_gguf_file_info() {
-        let info = GgufFileInfo {
-            rfilename: "model-Q4_K_M.gguf".to_string(),
-            size: 4096,
-        };
-        let file = GgufFile::from(info);
-        assert_eq!(file.filename, "model-Q4_K_M.gguf");
-        assert_eq!(file.size, 4096);
+    fn collect_manifest_files_finds_gguf_file() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"ggufFile":{"rfilename":"model-Q4.gguf","size":1024}}"#)
+                .unwrap();
+        let files = collect_manifest_files(&json);
+        assert_eq!(
+            files,
+            vec![GgufFile {
+                filename: "model-Q4.gguf".to_string(),
+                size: 1024
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_manifest_files_finds_multiple_file_types() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "ggufFile":{"rfilename":"model.gguf","size":1024},
+                "mmprojFile":{"rfilename":"mmproj-BF16.gguf","size":512}
+            }"#,
+        )
+        .unwrap();
+        let files = collect_manifest_files(&json);
+        assert_eq!(
+            files,
+            vec![
+                GgufFile {
+                    filename: "mmproj-BF16.gguf".to_string(),
+                    size: 512
+                },
+                GgufFile {
+                    filename: "model.gguf".to_string(),
+                    size: 1024
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_manifest_files_skips_entries_without_rfilename() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "ggufFile":{"rfilename":"model.gguf","size":1024},
+                "config":{"key":"value"}
+            }"#,
+        )
+        .unwrap();
+        let files = collect_manifest_files(&json);
+        assert_eq!(
+            files,
+            vec![GgufFile {
+                filename: "model.gguf".to_string(),
+                size: 1024
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_manifest_files_returns_empty_for_no_files() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"config":{"key":"value"}}"#).unwrap();
+        let files = collect_manifest_files(&json);
+        assert!(files.is_empty());
     }
 
     #[test]

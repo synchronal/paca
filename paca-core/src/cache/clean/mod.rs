@@ -2,17 +2,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
-use crate::cache::{cache_filename, extract_model_ref, get_cache_dir};
+use crate::cache::get_hub_dir;
 use crate::error::PacaError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CleanReason {
-    IncompleteDownload,
-    IncompleteManifest,
-    OrphanedEtag,
-    OrphanedGguf,
+    BrokenSymlink,
+    OrphanedBlob,
+    OrphanedSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,183 +23,30 @@ pub struct CleanResult {
     pub removed_files: Vec<RemovedFile>,
 }
 
-#[derive(Deserialize)]
-struct SavedManifest {
-    #[serde(rename = "ggufFile")]
-    gguf_file: Option<SavedGgufFileInfo>,
-}
-
-#[derive(Deserialize)]
-struct SavedGgufFileInfo {
-    rfilename: String,
-}
-
-fn expand_shard_filenames(filename: &str) -> Vec<String> {
-    let Some(stem) = filename.strip_suffix(".gguf") else {
-        return vec![filename.to_string()];
-    };
-
-    let Some((before_of, total_str)) = stem.rsplit_once("-of-") else {
-        return vec![filename.to_string()];
-    };
-
-    let Ok(total) = total_str.parse::<usize>() else {
-        return vec![filename.to_string()];
-    };
-
-    let Some((base, shard_str)) = before_of.rsplit_once('-') else {
-        return vec![filename.to_string()];
-    };
-
-    let width = shard_str.len();
-
-    (1..=total)
-        .map(|i| format!("{base}-{i:0>width$}-of-{total_str}.gguf"))
-        .collect()
-}
-
-fn expected_cache_filenames(manifest_path: &Path) -> Result<Vec<String>, PacaError> {
-    let model_ref = extract_model_ref(manifest_path)?;
-    let content = fs::read_to_string(manifest_path).map_err(PacaError::FileWrite)?;
-    let saved: SavedManifest = serde_json::from_str(&content)?;
-
-    let rfilename = match saved.gguf_file {
-        Some(info) => info.rfilename,
-        None => return Ok(Vec::new()),
-    };
-
-    let filenames = expand_shard_filenames(&rfilename);
-    Ok(filenames
-        .iter()
-        .map(|f| cache_filename(&model_ref, f))
-        .collect())
-}
-
-pub fn clean_cache(cache_dir: Option<PathBuf>) -> Result<CleanResult, PacaError> {
-    let cache_dir = match cache_dir {
+pub fn clean_cache(hub_dir: Option<PathBuf>) -> Result<CleanResult, PacaError> {
+    let hub_dir = match hub_dir {
         Some(dir) => dir,
-        None => get_cache_dir()?,
+        None => get_hub_dir()?,
     };
 
-    if !cache_dir.exists() {
+    if !hub_dir.exists() {
         return Ok(CleanResult {
             removed_files: Vec::new(),
         });
     }
 
-    let mut manifests: Vec<PathBuf> = Vec::new();
-    let mut ggufs: HashSet<String> = HashSet::new();
-    let mut etags: HashSet<String> = HashSet::new();
-
-    for entry in fs::read_dir(&cache_dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if name.starts_with("manifest=") && name.ends_with(".json") {
-            manifests.push(entry.path());
-        } else if name.ends_with(".gguf") {
-            ggufs.insert(name);
-        } else if name.ends_with(".etag") {
-            etags.insert(name);
-        }
-    }
-
     let mut removed_files = Vec::new();
-    let mut claimed_ggufs: HashSet<String> = HashSet::new();
-    let mut removed_ggufs: HashSet<String> = HashSet::new();
 
-    for manifest_path in &manifests {
-        let expected = match expected_cache_filenames(manifest_path) {
-            Ok(filenames) => filenames,
-            Err(_) => {
-                // Unparseable manifest — remove it
-                fs::remove_file(manifest_path).map_err(PacaError::FileDelete)?;
-                removed_files.push(RemovedFile {
-                    path: manifest_path.clone(),
-                    reason: CleanReason::IncompleteManifest,
-                });
-                continue;
-            }
-        };
+    for entry in fs::read_dir(&hub_dir)? {
+        let entry = entry?;
+        let dir_name = entry.file_name().to_string_lossy().to_string();
 
-        let all_present = expected.iter().all(|f| ggufs.contains(f));
-
-        if all_present {
-            for f in &expected {
-                claimed_ggufs.insert(f.clone());
-            }
-        } else {
-            // Incomplete manifest — remove manifest + partial GGUFs + etags
-            fs::remove_file(manifest_path).map_err(PacaError::FileDelete)?;
-            removed_files.push(RemovedFile {
-                path: manifest_path.clone(),
-                reason: CleanReason::IncompleteManifest,
-            });
-
-            for f in &expected {
-                if ggufs.contains(f) {
-                    let gguf_path = cache_dir.join(f);
-                    fs::remove_file(&gguf_path).map_err(PacaError::FileDelete)?;
-                    removed_files.push(RemovedFile {
-                        path: gguf_path,
-                        reason: CleanReason::IncompleteDownload,
-                    });
-                    removed_ggufs.insert(f.clone());
-                }
-
-                let etag_name = format!("{}.etag", f);
-                if etags.contains(&etag_name) {
-                    let etag_path = cache_dir.join(&etag_name);
-                    fs::remove_file(&etag_path).map_err(PacaError::FileDelete)?;
-                    removed_files.push(RemovedFile {
-                        path: etag_path,
-                        reason: CleanReason::IncompleteDownload,
-                    });
-                }
-            }
-        }
-    }
-
-    // Orphaned GGUFs — not claimed by any complete manifest
-    for gguf_name in &ggufs {
-        if claimed_ggufs.contains(gguf_name) || removed_ggufs.contains(gguf_name) {
+        if !dir_name.starts_with("models--") || !entry.path().is_dir() {
             continue;
         }
 
-        let gguf_path = cache_dir.join(gguf_name);
-        fs::remove_file(&gguf_path).map_err(PacaError::FileDelete)?;
-        removed_files.push(RemovedFile {
-            path: gguf_path,
-            reason: CleanReason::OrphanedGguf,
-        });
-        removed_ggufs.insert(gguf_name.clone());
-
-        let etag_name = format!("{}.etag", gguf_name);
-        if etags.contains(&etag_name) {
-            let etag_path = cache_dir.join(&etag_name);
-            fs::remove_file(&etag_path).map_err(PacaError::FileDelete)?;
-            removed_files.push(RemovedFile {
-                path: etag_path,
-                reason: CleanReason::OrphanedEtag,
-            });
-        }
-    }
-
-    // Dangling etags — no corresponding GGUF
-    for etag_name in &etags {
-        let gguf_name = etag_name.strip_suffix(".etag").unwrap_or(etag_name);
-        if ggufs.contains(gguf_name) && !removed_ggufs.contains(gguf_name) {
-            continue;
-        }
-
-        let etag_path = cache_dir.join(etag_name);
-        if etag_path.exists() {
-            fs::remove_file(&etag_path).map_err(PacaError::FileDelete)?;
-            removed_files.push(RemovedFile {
-                path: etag_path,
-                reason: CleanReason::OrphanedEtag,
-            });
-        }
+        let model_dir = entry.path();
+        clean_model_dir(&model_dir, &mut removed_files)?;
     }
 
     removed_files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -210,57 +54,174 @@ pub fn clean_cache(cache_dir: Option<PathBuf>) -> Result<CleanResult, PacaError>
     Ok(CleanResult { removed_files })
 }
 
+fn clean_model_dir(
+    model_dir: &Path,
+    removed_files: &mut Vec<RemovedFile>,
+) -> Result<(), PacaError> {
+    let refs_dir = model_dir.join("refs");
+    let snapshots_dir = model_dir.join("snapshots");
+    let blobs_dir = model_dir.join("blobs");
+
+    // Read the current commit from refs/main
+    let current_commit = refs_dir
+        .join("main")
+        .exists()
+        .then(|| fs::read_to_string(refs_dir.join("main")).ok())
+        .flatten();
+
+    // Remove snapshots not referenced by refs/main
+    if snapshots_dir.is_dir() {
+        for snapshot_entry in fs::read_dir(&snapshots_dir)? {
+            let snapshot_entry = snapshot_entry?;
+            let snapshot_name = snapshot_entry.file_name().to_string_lossy().to_string();
+
+            if current_commit.as_deref() != Some(&snapshot_name) {
+                remove_dir_recursive(
+                    &snapshot_entry.path(),
+                    CleanReason::OrphanedSnapshot,
+                    removed_files,
+                )?;
+            }
+        }
+    }
+
+    // Walk remaining snapshots to collect referenced blob hashes and remove broken symlinks
+    let mut referenced_blobs: HashSet<String> = HashSet::new();
+
+    if snapshots_dir.is_dir() {
+        collect_blob_refs_recursive(&snapshots_dir, &mut referenced_blobs, removed_files)?;
+    }
+
+    // Remove orphaned blobs
+    if blobs_dir.is_dir() {
+        for blob_entry in fs::read_dir(&blobs_dir)? {
+            let blob_entry = blob_entry?;
+            let blob_name = blob_entry.file_name().to_string_lossy().to_string();
+
+            if !referenced_blobs.contains(&blob_name) {
+                fs::remove_file(blob_entry.path()).map_err(PacaError::FileDelete)?;
+                removed_files.push(RemovedFile {
+                    path: blob_entry.path(),
+                    reason: CleanReason::OrphanedBlob,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_blob_refs_recursive(
+    dir: &Path,
+    referenced_blobs: &mut HashSet<String>,
+    removed_files: &mut Vec<RemovedFile>,
+) -> Result<(), PacaError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            collect_blob_refs_recursive(&path, referenced_blobs, removed_files)?;
+        } else if path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            if let Ok(target) = fs::read_link(&path) {
+                let target_str = target.to_string_lossy();
+                if let Some(hash) = target_str.rsplit_once("blobs/").map(|(_, h)| h.to_string()) {
+                    // Check if the symlink target actually exists
+                    if path.exists() {
+                        referenced_blobs.insert(hash);
+                    } else {
+                        fs::remove_file(&path).map_err(PacaError::FileDelete)?;
+                        removed_files.push(RemovedFile {
+                            path,
+                            reason: CleanReason::BrokenSymlink,
+                        });
+                    }
+                }
+            } else {
+                fs::remove_file(&path).map_err(PacaError::FileDelete)?;
+                removed_files.push(RemovedFile {
+                    path,
+                    reason: CleanReason::BrokenSymlink,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_dir_recursive(
+    dir: &Path,
+    reason: CleanReason,
+    removed_files: &mut Vec<RemovedFile>,
+) -> Result<(), PacaError> {
+    if !dir.exists() && dir.symlink_metadata().is_err() {
+        return Ok(());
+    }
+
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let is_symlink = path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink());
+
+            if path.is_dir() && !is_symlink {
+                remove_dir_recursive(&path, reason.clone(), removed_files)?;
+            } else {
+                fs::remove_file(&path).map_err(PacaError::FileDelete)?;
+                removed_files.push(RemovedFile {
+                    path,
+                    reason: reason.clone(),
+                });
+            }
+        }
+        fs::remove_dir(dir).map_err(PacaError::FileDelete)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::fs;
+    use std::os::unix::fs::symlink;
 
-    use crate::cache::save_etag;
-
-    // --- expand_shard_filenames tests ---
-
-    #[test]
-    fn expand_shard_filenames_returns_single_for_non_sharded() {
-        let result = expand_shard_filenames("model-Q4_K_M.gguf");
-        assert_eq!(result, vec!["model-Q4_K_M.gguf"]);
+    fn setup_model_dir(hub: &std::path::Path, owner: &str, model: &str) -> PathBuf {
+        let model_dir = hub.join(format!("models--{owner}--{model}"));
+        fs::create_dir_all(model_dir.join("blobs")).unwrap();
+        fs::create_dir_all(model_dir.join("refs")).unwrap();
+        fs::create_dir_all(model_dir.join("snapshots")).unwrap();
+        model_dir
     }
 
-    #[test]
-    fn expand_shard_filenames_returns_all_for_two_shards() {
-        let result = expand_shard_filenames("BF16/Model-BF16-00001-of-00002.gguf");
-        assert_eq!(
-            result,
-            vec![
-                "BF16/Model-BF16-00001-of-00002.gguf",
-                "BF16/Model-BF16-00002-of-00002.gguf",
-            ]
-        );
+    fn write_blob(model_dir: &std::path::Path, hash: &str) {
+        fs::write(model_dir.join("blobs").join(hash), b"fake blob data").unwrap();
     }
 
-    #[test]
-    fn expand_shard_filenames_returns_all_for_fifteen_shards() {
-        let result = expand_shard_filenames("BF16/GLM-4.7-BF16-00001-of-00015.gguf");
-        assert_eq!(result.len(), 15);
-        assert_eq!(result[0], "BF16/GLM-4.7-BF16-00001-of-00015.gguf");
-        assert_eq!(result[7], "BF16/GLM-4.7-BF16-00008-of-00015.gguf");
-        assert_eq!(result[14], "BF16/GLM-4.7-BF16-00015-of-00015.gguf");
+    fn write_ref(model_dir: &std::path::Path, commit: &str) {
+        fs::write(model_dir.join("refs").join("main"), commit).unwrap();
     }
 
-    // --- clean_cache integration tests ---
-
-    fn write_manifest(dir: &Path, owner: &str, model: &str, tag: &str, rfilename: &str) {
-        let manifest_name = format!("manifest={owner}={model}={tag}.json");
-        let json = format!(r#"{{"ggufFile":{{"rfilename":"{rfilename}","size":1024}}}}"#);
-        fs::write(dir.join(manifest_name), json).unwrap();
-    }
-
-    fn write_gguf(dir: &Path, filename: &str) {
-        fs::write(dir.join(filename), b"fake gguf data").unwrap();
-    }
-
-    fn file_exists(dir: &Path, filename: &str) -> bool {
-        dir.join(filename).exists()
+    fn write_snapshot_symlink(
+        model_dir: &std::path::Path,
+        commit: &str,
+        filename: &str,
+        blob_hash: &str,
+    ) {
+        let snapshot_dir = model_dir.join("snapshots").join(commit);
+        let symlink_path = snapshot_dir.join(filename);
+        if let Some(parent) = symlink_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let depth = filename.matches('/').count() + 2;
+        let target = format!("{}blobs/{}", "../".repeat(depth), blob_hash);
+        symlink(&target, &symlink_path).unwrap();
     }
 
     #[test]
@@ -279,198 +240,149 @@ mod tests {
     }
 
     #[test]
-    fn clean_cache_complete_single_file_model_removes_nothing() {
+    fn clean_cache_complete_model_removes_nothing() {
         let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
 
-        write_manifest(dir.path(), "owner", "model-GGUF", "Q4", "model-Q4.gguf");
-        write_gguf(dir.path(), "owner_model-GGUF_model-Q4.gguf");
-        save_etag(dir.path(), "owner_model-GGUF_model-Q4.gguf", "\"etag1\"").unwrap();
+        write_blob(&model_dir, "abc123");
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "abc123");
 
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
         assert!(result.removed_files.is_empty());
-        assert!(file_exists(dir.path(), "manifest=owner=model-GGUF=Q4.json"));
-        assert!(file_exists(dir.path(), "owner_model-GGUF_model-Q4.gguf"));
-        assert!(file_exists(
-            dir.path(),
-            "owner_model-GGUF_model-Q4.gguf.etag"
-        ));
     }
 
     #[test]
     fn clean_cache_complete_sharded_model_removes_nothing() {
         let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
 
-        write_manifest(
-            dir.path(),
-            "owner",
-            "model-GGUF",
-            "BF16",
+        write_blob(&model_dir, "hash1");
+        write_blob(&model_dir, "hash2");
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(
+            &model_dir,
+            "commit1",
             "BF16/model-BF16-00001-of-00002.gguf",
+            "hash1",
         );
-        write_gguf(
-            dir.path(),
-            "owner_model-GGUF_BF16_model-BF16-00001-of-00002.gguf",
+        write_snapshot_symlink(
+            &model_dir,
+            "commit1",
+            "BF16/model-BF16-00002-of-00002.gguf",
+            "hash2",
         );
-        write_gguf(
-            dir.path(),
-            "owner_model-GGUF_BF16_model-BF16-00002-of-00002.gguf",
-        );
-
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
         assert!(result.removed_files.is_empty());
     }
 
     #[test]
-    fn clean_cache_incomplete_manifest_removes_manifest_and_partial_files() {
+    fn clean_cache_removes_orphaned_snapshot() {
         let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
 
-        // Manifest expects 2 shards but only 1 exists
-        write_manifest(
-            dir.path(),
-            "owner",
-            "model-GGUF",
-            "BF16",
-            "BF16/model-BF16-00001-of-00002.gguf",
-        );
-        write_gguf(
-            dir.path(),
-            "owner_model-GGUF_BF16_model-BF16-00001-of-00002.gguf",
-        );
-        save_etag(
-            dir.path(),
-            "owner_model-GGUF_BF16_model-BF16-00001-of-00002.gguf",
-            "\"etag1\"",
-        )
-        .unwrap();
+        write_blob(&model_dir, "abc123");
+        write_ref(&model_dir, "commit2");
+        // Current snapshot
+        write_snapshot_symlink(&model_dir, "commit2", "model-Q4.gguf", "abc123");
+        // Old snapshot
+        write_blob(&model_dir, "oldhash");
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "oldhash");
 
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
 
-        assert!(!file_exists(
-            dir.path(),
-            "manifest=owner=model-GGUF=BF16.json"
-        ));
-        assert!(!file_exists(
-            dir.path(),
-            "owner_model-GGUF_BF16_model-BF16-00001-of-00002.gguf"
-        ));
-        assert!(!file_exists(
-            dir.path(),
-            "owner_model-GGUF_BF16_model-BF16-00001-of-00002.gguf.etag"
-        ));
+        // Old snapshot's symlink should be removed
+        let orphaned_snapshot_reasons: Vec<_> = result
+            .removed_files
+            .iter()
+            .filter(|r| r.reason == CleanReason::OrphanedSnapshot)
+            .collect();
+        assert_eq!(orphaned_snapshot_reasons.len(), 1);
 
-        assert_eq!(result.removed_files.len(), 3);
+        // oldhash blob should be orphaned too
+        let orphaned_blob_reasons: Vec<_> = result
+            .removed_files
+            .iter()
+            .filter(|r| r.reason == CleanReason::OrphanedBlob)
+            .collect();
+        assert_eq!(orphaned_blob_reasons.len(), 1);
 
-        let reasons: Vec<&CleanReason> = result.removed_files.iter().map(|r| &r.reason).collect();
-        assert!(reasons.contains(&&CleanReason::IncompleteManifest));
-        assert!(reasons.contains(&&CleanReason::IncompleteDownload));
+        // Current snapshot should still exist
+        assert!(model_dir.join("snapshots/commit2/model-Q4.gguf").exists());
+        assert!(model_dir.join("blobs/abc123").exists());
     }
 
     #[test]
-    fn clean_cache_orphaned_gguf_removes_gguf_and_etag() {
+    fn clean_cache_removes_broken_symlink() {
         let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
 
-        // GGUF with no manifest
-        write_gguf(dir.path(), "owner_model-GGUF_model-Q4.gguf");
-        save_etag(dir.path(), "owner_model-GGUF_model-Q4.gguf", "\"etag1\"").unwrap();
+        // Don't write the actual blob — symlink will be broken
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "nonexistent_hash");
 
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
 
-        assert!(!file_exists(dir.path(), "owner_model-GGUF_model-Q4.gguf"));
-        assert!(!file_exists(
-            dir.path(),
-            "owner_model-GGUF_model-Q4.gguf.etag"
-        ));
-
-        assert_eq!(result.removed_files.len(), 2);
-
-        let reasons: Vec<&CleanReason> = result.removed_files.iter().map(|r| &r.reason).collect();
-        assert!(reasons.contains(&&CleanReason::OrphanedGguf));
-        assert!(reasons.contains(&&CleanReason::OrphanedEtag));
+        let broken_reasons: Vec<_> = result
+            .removed_files
+            .iter()
+            .filter(|r| r.reason == CleanReason::BrokenSymlink)
+            .collect();
+        assert_eq!(broken_reasons.len(), 1);
     }
 
     #[test]
-    fn clean_cache_mixed_scenario_removes_only_stale_files() {
+    fn clean_cache_removes_orphaned_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+
+        write_blob(&model_dir, "used_hash");
+        write_blob(&model_dir, "orphaned_hash");
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "used_hash");
+
+        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
+
+        let orphaned_reasons: Vec<_> = result
+            .removed_files
+            .iter()
+            .filter(|r| r.reason == CleanReason::OrphanedBlob)
+            .collect();
+        assert_eq!(orphaned_reasons.len(), 1);
+        assert!(orphaned_reasons[0].path.ends_with("orphaned_hash"));
+
+        // Used blob should still exist
+        assert!(model_dir.join("blobs/used_hash").exists());
+    }
+
+    #[test]
+    fn clean_cache_mixed_scenario() {
         let dir = tempfile::tempdir().unwrap();
 
         // Complete model — should be kept
-        write_manifest(dir.path(), "owner", "good-GGUF", "Q4", "model-Q4.gguf");
-        write_gguf(dir.path(), "owner_good-GGUF_model-Q4.gguf");
-        save_etag(dir.path(), "owner_good-GGUF_model-Q4.gguf", "\"good\"").unwrap();
+        let good_dir = setup_model_dir(dir.path(), "owner", "good-GGUF");
+        write_blob(&good_dir, "good_hash");
+        write_ref(&good_dir, "commit1");
+        write_snapshot_symlink(&good_dir, "commit1", "model-Q4.gguf", "good_hash");
 
-        // Incomplete manifest — should be removed
-        write_manifest(
-            dir.path(),
-            "owner",
-            "bad-GGUF",
-            "BF16",
-            "BF16/model-BF16-00001-of-00002.gguf",
-        );
-        write_gguf(
-            dir.path(),
-            "owner_bad-GGUF_BF16_model-BF16-00001-of-00002.gguf",
-        );
-
-        // Orphaned GGUF — should be removed
-        write_gguf(dir.path(), "owner_orphan-GGUF_model.gguf");
+        // Model with orphaned blob — blob should be removed
+        let blob_dir = setup_model_dir(dir.path(), "owner", "blob-GGUF");
+        write_blob(&blob_dir, "used");
+        write_blob(&blob_dir, "orphaned");
+        write_ref(&blob_dir, "commit1");
+        write_snapshot_symlink(&blob_dir, "commit1", "model.gguf", "used");
 
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
 
-        // Complete model untouched
-        assert!(file_exists(dir.path(), "manifest=owner=good-GGUF=Q4.json"));
-        assert!(file_exists(dir.path(), "owner_good-GGUF_model-Q4.gguf"));
-        assert!(file_exists(
-            dir.path(),
-            "owner_good-GGUF_model-Q4.gguf.etag"
-        ));
+        // Good model untouched
+        assert!(good_dir.join("blobs/good_hash").exists());
+        assert!(good_dir.join("snapshots/commit1/model-Q4.gguf").exists());
 
-        // Incomplete manifest removed
-        assert!(!file_exists(
-            dir.path(),
-            "manifest=owner=bad-GGUF=BF16.json"
-        ));
-        assert!(!file_exists(
-            dir.path(),
-            "owner_bad-GGUF_BF16_model-BF16-00001-of-00002.gguf"
-        ));
+        // Orphaned blob removed
+        assert!(!blob_dir.join("blobs/orphaned").exists());
+        assert!(blob_dir.join("blobs/used").exists());
 
-        // Orphaned GGUF removed
-        assert!(!file_exists(dir.path(), "owner_orphan-GGUF_model.gguf"));
-
-        // Should have removed: manifest + 1 partial GGUF + 1 orphaned GGUF = 3
-        assert_eq!(result.removed_files.len(), 3);
-    }
-
-    #[test]
-    fn clean_cache_unparseable_manifest_removes_it() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let manifest_name = "manifest=owner=broken=Q4.json";
-        fs::write(dir.path().join(manifest_name), "not valid json!!!").unwrap();
-
-        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
-
-        assert!(!file_exists(dir.path(), manifest_name));
         assert_eq!(result.removed_files.len(), 1);
-        assert_eq!(
-            result.removed_files[0].reason,
-            CleanReason::IncompleteManifest
-        );
-    }
-
-    #[test]
-    fn clean_cache_dangling_etag_without_gguf_removed() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Etag with no corresponding GGUF
-        save_etag(dir.path(), "owner_model-GGUF_model-Q4.gguf", "\"etag1\"").unwrap();
-
-        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
-
-        assert!(!file_exists(
-            dir.path(),
-            "owner_model-GGUF_model-Q4.gguf.etag"
-        ));
-        assert_eq!(result.removed_files.len(), 1);
-        assert_eq!(result.removed_files[0].reason, CleanReason::OrphanedEtag);
+        assert_eq!(result.removed_files[0].reason, CleanReason::OrphanedBlob);
     }
 }

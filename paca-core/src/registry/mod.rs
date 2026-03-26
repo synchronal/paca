@@ -5,11 +5,21 @@ use std::env;
 
 use reqwest::blocking::Client;
 use reqwest::header::HeaderMap;
+use reqwest::redirect;
 
 use crate::error::PacaError;
 
 /// User agent string used for HTTP requests
 const USER_AGENT: &str = "llama-cpp";
+
+/// Information resolved from a HEAD request to a HuggingFace file URL
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolveInfo {
+    /// SHA-256 hash of the blob content (from X-Linked-Etag or ETag header)
+    pub blob_hash: String,
+    /// Commit hash for this revision (from X-Repo-Commit header)
+    pub commit_hash: String,
+}
 
 pub fn default_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -25,17 +35,37 @@ pub fn default_headers() -> HeaderMap {
     headers
 }
 
-pub fn fetch_etag(client: &Client, url: &str) -> Result<String, PacaError> {
+/// Builds a Client configured for resolve-info HEAD requests (no redirect following).
+pub fn resolve_client() -> Result<Client, PacaError> {
+    Ok(Client::builder()
+        .default_headers(default_headers())
+        .redirect(redirect::Policy::none())
+        .build()?)
+}
+
+pub fn fetch_resolve_info(client: &Client, url: &str) -> Result<ResolveInfo, PacaError> {
     let response = client.head(url).send()?;
+    let headers = response.headers();
 
-    let etag = response
-        .headers()
-        .get("etag")
+    let commit_hash = headers
+        .get("x-repo-commit")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .map(|s| s.to_string())
+        .ok_or_else(|| PacaError::MissingCommitHash(url.to_string()))?;
 
-    Ok(etag)
+    let blob_hash = headers
+        .get("x-linked-etag")
+        .or_else(|| headers.get("etag"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| PacaError::MissingBlobHash(url.to_string()))?;
+
+    Ok(ResolveInfo {
+        blob_hash,
+        commit_hash,
+    })
 }
 
 #[cfg(test)]

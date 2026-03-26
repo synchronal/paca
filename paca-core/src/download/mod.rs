@@ -7,31 +7,35 @@ use std::path::{Path, PathBuf};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 
-use crate::cache::{cache_filename, etag_matches, get_cache_dir, save_etag, save_manifest};
+use crate::cache::{blob_exists, blobs_dir, get_hub_dir, save_ref, snapshots_dir};
 use crate::model::ModelRef;
 use crate::registry::default_headers;
 use crate::registry::endpoint::get_model_endpoint;
-use crate::registry::fetch_etag;
 use crate::registry::manifest::fetch_manifest;
+use crate::registry::{fetch_resolve_info, resolve_client};
 
-/// Downloads a GGUF model from HuggingFace with support for resumable downloads
-/// and incremental updates using ETag validation
-pub fn download_model(model: &str, cache_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, PacaError> {
+/// Downloads a GGUF model from HuggingFace into the HF Hub cache format
+pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, PacaError> {
     let model_ref: ModelRef = model.parse()?;
     let headers = default_headers();
     let client = Client::builder().default_headers(headers).build()?;
 
     let manifest = fetch_manifest(&client, &model_ref)?;
-    let cache_dir = match cache_dir {
+    let hub_dir = match hub_dir {
         Some(dir) => {
             fs::create_dir_all(&dir).map_err(PacaError::CacheDir)?;
             dir
         }
-        None => get_cache_dir()?,
+        None => get_hub_dir()?,
     };
     let endpoint = get_model_endpoint();
+    let head_client = resolve_client()?;
+
+    let blobs = blobs_dir(&hub_dir, &model_ref);
+    fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
 
     let mut paths = Vec::new();
+    let mut commit_hash = None;
 
     let multi = MultiProgress::new();
     let bars: Vec<ProgressBar> = manifest
@@ -46,9 +50,6 @@ pub fn download_model(model: &str, cache_dir: Option<PathBuf>) -> Result<Vec<Pat
         .collect();
 
     for (gguf_file, bar) in manifest.gguf_files.iter().zip(bars) {
-        let filename = cache_filename(&model_ref, &gguf_file.filename);
-        let file_path = cache_dir.join(&filename);
-
         let url = format!(
             "{}/{}/resolve/main/{}",
             endpoint,
@@ -56,34 +57,83 @@ pub fn download_model(model: &str, cache_dir: Option<PathBuf>) -> Result<Vec<Pat
             gguf_file.filename
         );
 
-        let remote_etag = fetch_etag(&client, &url)?;
+        let resolve_info = fetch_resolve_info(&head_client, &url)?;
 
-        if !etag_matches(&cache_dir, &filename, &remote_etag) {
-            save_etag(&cache_dir, &filename, &remote_etag)?;
+        if commit_hash.is_none() {
+            commit_hash = Some(resolve_info.commit_hash.clone());
         }
 
-        if file_path.exists() {
-            let existing_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+        let snapshot_id = &resolve_info.commit_hash;
+
+        let blob_path = blobs.join(&resolve_info.blob_hash);
+
+        if blob_exists(&hub_dir, &model_ref, &resolve_info.blob_hash) {
+            let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
 
             if existing_size >= gguf_file.size {
                 bar.set_style(download_style());
                 bar.set_position(gguf_file.size);
                 bar.finish();
-                paths.push(file_path);
+
+                let symlink_path = create_snapshot_symlink(
+                    &hub_dir,
+                    &model_ref,
+                    snapshot_id,
+                    &gguf_file.filename,
+                    &resolve_info.blob_hash,
+                )?;
+                paths.push(symlink_path);
                 continue;
             }
 
-            download_file(&client, &url, &file_path, existing_size, &bar)?;
+            download_file(&client, &url, &blob_path, existing_size, &bar)?;
         } else {
-            download_file(&client, &url, &file_path, 0, &bar)?;
+            download_file(&client, &url, &blob_path, 0, &bar)?;
         }
 
-        paths.push(file_path);
+        let symlink_path = create_snapshot_symlink(
+            &hub_dir,
+            &model_ref,
+            snapshot_id,
+            &gguf_file.filename,
+            &resolve_info.blob_hash,
+        )?;
+        paths.push(symlink_path);
     }
 
-    save_manifest(&cache_dir, &model_ref, &manifest.raw_json)?;
+    if let Some(commit) = &commit_hash {
+        save_ref(&hub_dir, &model_ref, commit)?;
+    }
 
     Ok(paths)
+}
+
+fn create_snapshot_symlink(
+    hub_dir: &Path,
+    model_ref: &ModelRef,
+    commit_hash: &str,
+    filename: &str,
+    blob_hash: &str,
+) -> Result<PathBuf, PacaError> {
+    let snapshot_dir = snapshots_dir(hub_dir, model_ref).join(commit_hash);
+
+    let symlink_path = snapshot_dir.join(filename);
+    if let Some(parent) = symlink_path.parent() {
+        fs::create_dir_all(parent).map_err(PacaError::CacheDir)?;
+    }
+
+    // Calculate relative path from symlink to blob
+    let depth = filename.matches('/').count() + 2;
+    let relative_blob = format!("{}blobs/{}", "../".repeat(depth), blob_hash);
+
+    // Remove existing symlink if present
+    if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+        fs::remove_file(&symlink_path).map_err(PacaError::FileDelete)?;
+    }
+
+    std::os::unix::fs::symlink(&relative_blob, &symlink_path).map_err(PacaError::Symlink)?;
+
+    Ok(symlink_path)
 }
 
 fn download_file(
@@ -156,5 +206,68 @@ mod tests {
     fn download_model_returns_error_for_missing_tag() {
         let result = download_model("owner/model", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_snapshot_symlink_creates_symlink_for_root_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        let blob_dir = blobs_dir(dir.path(), &model_ref);
+        fs::create_dir_all(&blob_dir).unwrap();
+        fs::write(blob_dir.join("abc123hash"), b"fake data").unwrap();
+
+        let result = create_snapshot_symlink(
+            dir.path(),
+            &model_ref,
+            "commitabc",
+            "model-Q4.gguf",
+            "abc123hash",
+        )
+        .unwrap();
+
+        assert!(result.symlink_metadata().unwrap().file_type().is_symlink());
+        let target = fs::read_link(&result).unwrap();
+        assert_eq!(target.to_str().unwrap(), "../../blobs/abc123hash");
+    }
+
+    #[test]
+    fn create_snapshot_symlink_creates_symlink_for_subdir_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_ref: ModelRef = "owner/model-GGUF:BF16".parse().unwrap();
+        let blob_dir = blobs_dir(dir.path(), &model_ref);
+        fs::create_dir_all(&blob_dir).unwrap();
+        fs::write(blob_dir.join("def456hash"), b"fake data").unwrap();
+
+        let result = create_snapshot_symlink(
+            dir.path(),
+            &model_ref,
+            "commitdef",
+            "BF16/model-BF16-00001-of-00002.gguf",
+            "def456hash",
+        )
+        .unwrap();
+
+        assert!(result.symlink_metadata().unwrap().file_type().is_symlink());
+        let target = fs::read_link(&result).unwrap();
+        assert_eq!(target.to_str().unwrap(), "../../../blobs/def456hash");
+    }
+
+    #[test]
+    fn create_snapshot_symlink_replaces_existing_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        let blob_dir = blobs_dir(dir.path(), &model_ref);
+        fs::create_dir_all(&blob_dir).unwrap();
+        fs::write(blob_dir.join("hash1"), b"data1").unwrap();
+        fs::write(blob_dir.join("hash2"), b"data2").unwrap();
+
+        create_snapshot_symlink(dir.path(), &model_ref, "commit1", "model.gguf", "hash1").unwrap();
+
+        let result =
+            create_snapshot_symlink(dir.path(), &model_ref, "commit1", "model.gguf", "hash2")
+                .unwrap();
+
+        let target = fs::read_link(&result).unwrap();
+        assert_eq!(target.to_str().unwrap(), "../../blobs/hash2");
     }
 }

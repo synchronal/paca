@@ -7,7 +7,7 @@ use cli::Cli;
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Clean(args) => {
-            let result = paca_core::cache::clean::clean_cache(args.cache_dir)?;
+            let result = paca_core::cache::clean::clean_cache(args.hub_dir)?;
             if result.removed_files.is_empty() {
                 println!("Cache is clean.");
             } else {
@@ -17,7 +17,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Download(args) => {
-            let paths = paca_core::download::download_model(&args.model, args.cache_dir)?;
+            let paths = paca_core::download::download_model(&args.model, args.hub_dir)?;
             for path in &paths {
                 println!("{}", path.display());
             }
@@ -26,7 +26,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             println!("paca {}", env!("CARGO_PKG_VERSION"));
         }
         cli::Commands::List(args) => {
-            let models = paca_core::cache::list_models(args.cache_dir)?;
+            let models = paca_core::cache::list_models(args.hub_dir)?;
             if models.is_empty() {
                 println!("No downloaded models found.");
             } else {
@@ -36,7 +36,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Outdated(args) => {
-            let outdated = paca_core::cache::check_outdated_models(args.cache_dir)?;
+            let outdated = paca_core::cache::check_outdated_models(args.hub_dir)?;
             if outdated.is_empty() {
                 println!("All downloaded models are up to date.");
             } else {
@@ -63,19 +63,19 @@ mod tests {
         let cli = result.unwrap();
         assert_eq!(
             cli.command,
-            cli::Commands::Clean(cli::CommonArgs { cache_dir: None })
+            cli::Commands::Clean(cli::CommonArgs { hub_dir: None })
         );
     }
 
     #[test]
-    fn cli_parses_clean_with_cache_dir() {
-        let result = Cli::try_parse_from(["paca", "clean", "--cache-dir", "/tmp/models"]);
+    fn cli_parses_clean_with_hub_dir() {
+        let result = Cli::try_parse_from(["paca", "clean", "--hub-dir", "/tmp/models"]);
         assert!(result.is_ok());
         let cli = result.unwrap();
         assert_eq!(
             cli.command,
             cli::Commands::Clean(cli::CommonArgs {
-                cache_dir: Some(PathBuf::from("/tmp/models")),
+                hub_dir: Some(PathBuf::from("/tmp/models")),
             })
         );
     }
@@ -104,18 +104,18 @@ mod tests {
         assert_eq!(
             cli.command,
             cli::Commands::Download(ModelArgs {
-                cache_dir: None,
+                hub_dir: None,
                 model: String::from("owner/model:tag"),
             })
         );
     }
 
     #[test]
-    fn cli_parses_download_with_cache_dir() {
+    fn cli_parses_download_with_hub_dir() {
         let result = Cli::try_parse_from([
             "paca",
             "download",
-            "--cache-dir",
+            "--hub-dir",
             "/tmp/models",
             "owner/model:tag",
         ]);
@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(
             cli.command,
             cli::Commands::Download(ModelArgs {
-                cache_dir: Some(PathBuf::from("/tmp/models")),
+                hub_dir: Some(PathBuf::from("/tmp/models")),
                 model: String::from("owner/model:tag"),
             })
         );
@@ -145,14 +145,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_outdated_with_cache_dir() {
-        let result = Cli::try_parse_from(["paca", "outdated", "--cache-dir", "/tmp/models"]);
+    fn cli_parses_outdated_with_hub_dir() {
+        let result = Cli::try_parse_from(["paca", "outdated", "--hub-dir", "/tmp/models"]);
         assert!(result.is_ok());
         let cli = result.unwrap();
         assert_eq!(
             cli.command,
             cli::Commands::Outdated(cli::CommonArgs {
-                cache_dir: Some(PathBuf::from("/tmp/models")),
+                hub_dir: Some(PathBuf::from("/tmp/models")),
             })
         );
     }

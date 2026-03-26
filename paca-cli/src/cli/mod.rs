@@ -29,16 +29,16 @@ pub enum Commands {
 
 #[derive(Args, Debug, PartialEq)]
 pub struct CommonArgs {
-    /// Override the cache directory for listing models
+    /// Override the HuggingFace Hub cache directory
     #[arg(long)]
-    pub cache_dir: Option<PathBuf>,
+    pub hub_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, PartialEq)]
 pub struct ModelArgs {
-    /// Override the cache directory for downloaded files
+    /// Override the HuggingFace Hub cache directory
     #[arg(long)]
-    pub cache_dir: Option<PathBuf>,
+    pub hub_dir: Option<PathBuf>,
 
     /// Model identifier (e.g., unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL)
     pub model: String,
