@@ -2,7 +2,7 @@ mod endpoint;
 mod manifest;
 mod model_ref;
 
-pub use crate::error::DownloadError;
+pub use crate::error::PacaError;
 
 use std::env;
 use std::fs::{self, File};
@@ -45,10 +45,7 @@ fn default_headers() -> HeaderMap {
 
 /// Downloads a GGUF model from HuggingFace with support for resumable downloads
 /// and incremental updates using ETag validation
-pub fn download_model(
-    model: &str,
-    cache_dir: Option<PathBuf>,
-) -> Result<Vec<PathBuf>, DownloadError> {
+pub fn download_model(model: &str, cache_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, PacaError> {
     let model_ref: ModelRef = model.parse()?;
     let headers = default_headers();
     let client = Client::builder().default_headers(headers).build()?;
@@ -56,7 +53,7 @@ pub fn download_model(
     let manifest = fetch_manifest(&client, &model_ref)?;
     let cache_dir = match cache_dir {
         Some(dir) => {
-            fs::create_dir_all(&dir).map_err(DownloadError::CacheDir)?;
+            fs::create_dir_all(&dir).map_err(PacaError::CacheDir)?;
             dir
         }
         None => get_cache_dir()?,
@@ -108,17 +105,13 @@ fn cache_filename(model_ref: &ModelRef, gguf_file: &str) -> String {
     format!("{}_{}_{}", model_ref.owner, model_ref.model, flat_gguf)
 }
 
-fn save_manifest(
-    cache_dir: &Path,
-    model_ref: &ModelRef,
-    raw_json: &str,
-) -> Result<(), DownloadError> {
+fn save_manifest(cache_dir: &Path, model_ref: &ModelRef, raw_json: &str) -> Result<(), PacaError> {
     let manifest_path = cache_dir.join(manifest_filename(model_ref));
-    fs::write(&manifest_path, raw_json).map_err(DownloadError::FileWrite)?;
+    fs::write(&manifest_path, raw_json).map_err(PacaError::FileWrite)?;
     Ok(())
 }
 
-fn fetch_etag(client: &Client, url: &str) -> Result<String, DownloadError> {
+fn fetch_etag(client: &Client, url: &str) -> Result<String, PacaError> {
     let response = client.head(url).send()?;
 
     let etag = response
@@ -138,23 +131,23 @@ fn etag_matches(cache_dir: &Path, filename: &str, remote_etag: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn save_etag(cache_dir: &Path, filename: &str, etag: &str) -> Result<(), DownloadError> {
+fn save_etag(cache_dir: &Path, filename: &str, etag: &str) -> Result<(), PacaError> {
     let etag_path = cache_dir.join(format!("{}.etag", filename));
-    fs::write(&etag_path, etag).map_err(DownloadError::FileWrite)?;
+    fs::write(&etag_path, etag).map_err(PacaError::FileWrite)?;
     Ok(())
 }
 
-fn get_cache_dir() -> Result<PathBuf, DownloadError> {
+fn get_cache_dir() -> Result<PathBuf, PacaError> {
     let cache_dir = dirs::cache_dir()
         .ok_or_else(|| {
-            DownloadError::CacheDir(std::io::Error::new(
+            PacaError::CacheDir(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Could not determine cache directory",
             ))
         })?
         .join("llama.cpp");
 
-    fs::create_dir_all(&cache_dir).map_err(DownloadError::CacheDir)?;
+    fs::create_dir_all(&cache_dir).map_err(PacaError::CacheDir)?;
 
     Ok(cache_dir)
 }
@@ -164,7 +157,7 @@ fn download_file(
     url: &str,
     path: &Path,
     resume_from: u64,
-) -> Result<(), DownloadError> {
+) -> Result<(), PacaError> {
     let mut request = client.get(url);
 
     if resume_from > 0 {
@@ -179,11 +172,11 @@ fn download_file(
         let file = fs::OpenOptions::new()
             .append(true)
             .open(path)
-            .map_err(DownloadError::FileWrite)?;
+            .map_err(PacaError::FileWrite)?;
         (BufWriter::new(file), resume_from)
     } else {
         (
-            BufWriter::new(File::create(path).map_err(DownloadError::FileWrite)?),
+            BufWriter::new(File::create(path).map_err(PacaError::FileWrite)?),
             0,
         )
     };
@@ -202,14 +195,12 @@ fn download_file(
     let mut buffer = [0u8; 131072];
 
     loop {
-        let bytes_read = response
-            .read(&mut buffer)
-            .map_err(DownloadError::FileWrite)?;
+        let bytes_read = response.read(&mut buffer).map_err(PacaError::FileWrite)?;
         if bytes_read == 0 {
             break;
         }
         file.write_all(&buffer[..bytes_read])
-            .map_err(DownloadError::FileWrite)?;
+            .map_err(PacaError::FileWrite)?;
         progress_bar.inc(bytes_read as u64);
     }
 
@@ -219,7 +210,7 @@ fn download_file(
 }
 
 /// Lists all downloaded models from the cache directory
-pub fn list_models(cache_dir: Option<PathBuf>) -> Result<Vec<ModelInfo>, DownloadError> {
+pub fn list_models(cache_dir: Option<PathBuf>) -> Result<Vec<ModelInfo>, PacaError> {
     let cache_dir = match cache_dir {
         Some(dir) => dir,
         None => get_cache_dir()?,
@@ -249,7 +240,7 @@ pub fn list_models(cache_dir: Option<PathBuf>) -> Result<Vec<ModelInfo>, Downloa
 }
 
 /// Parses a model manifest file and returns model information
-fn parse_model_manifest(path: &Path) -> Result<ModelInfo, DownloadError> {
+fn parse_model_manifest(path: &Path) -> Result<ModelInfo, PacaError> {
     let content = fs::read_to_string(path)?;
     let _json: serde_json::Value = serde_json::from_str(&content)?;
 
@@ -262,11 +253,11 @@ fn parse_model_manifest(path: &Path) -> Result<ModelInfo, DownloadError> {
 }
 
 /// Extracts the model reference from a manifest filename
-fn extract_model_ref(manifest_path: &Path) -> Result<ModelRef, DownloadError> {
+fn extract_model_ref(manifest_path: &Path) -> Result<ModelRef, PacaError> {
     let filename = manifest_path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| DownloadError::InvalidPath("Invalid filename".to_string()))?;
+        .ok_or_else(|| PacaError::InvalidPath("Invalid filename".to_string()))?;
 
     let parts: Vec<&str> = filename
         .strip_prefix("manifest=")
@@ -275,7 +266,7 @@ fn extract_model_ref(manifest_path: &Path) -> Result<ModelRef, DownloadError> {
         .collect();
 
     if parts.len() != 3 {
-        return Err(DownloadError::InvalidPath(
+        return Err(PacaError::InvalidPath(
             "Invalid manifest filename format".to_string(),
         ));
     }

@@ -3,7 +3,7 @@ use std::fmt;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
-use crate::error::DownloadError;
+use crate::error::PacaError;
 
 use super::endpoint::get_model_endpoint;
 use super::model_ref::ModelRef;
@@ -67,7 +67,7 @@ pub struct Manifest {
 }
 
 /// Fetches the model manifest from HuggingFace, handling both single and sharded files
-pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, DownloadError> {
+pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, PacaError> {
     let endpoint = get_model_endpoint();
     let url = format!(
         "{}/v2/{}/manifests/{}",
@@ -81,9 +81,7 @@ pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest,
     let raw_json = response.text()?;
     let manifest_response: ManifestResponse = serde_json::from_str(&raw_json)?;
 
-    let gguf_file_info = manifest_response
-        .gguf_file
-        .ok_or(DownloadError::NoGgufFile)?;
+    let gguf_file_info = manifest_response.gguf_file.ok_or(PacaError::NoGgufFile)?;
 
     let gguf_files = match shard_count(&gguf_file_info.rfilename) {
         Some(_) => fetch_tree_files(client, &endpoint, model_ref, &gguf_file_info.rfilename)?,
@@ -102,7 +100,7 @@ fn fetch_tree_files(
     endpoint: &str,
     model_ref: &ModelRef,
     rfilename: &str,
-) -> Result<Vec<GgufFile>, DownloadError> {
+) -> Result<Vec<GgufFile>, PacaError> {
     let subdir = rfilename.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
 
     let url = format!(

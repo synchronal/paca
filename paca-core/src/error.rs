@@ -2,7 +2,7 @@ use thiserror::Error;
 
 /// Errors that can occur during model download operations
 #[derive(Debug, Error)]
-pub enum DownloadError {
+pub enum PacaError {
     /// Failed to fetch the model manifest from HuggingFace
     #[error("Failed to fetch manifest: {0}")]
     ManifestFetch(#[from] reqwest::Error),
@@ -32,13 +32,13 @@ pub enum DownloadError {
     InvalidPath(String),
 }
 
-impl From<std::io::Error> for DownloadError {
+impl From<std::io::Error> for PacaError {
     fn from(err: std::io::Error) -> Self {
         match err.kind() {
             std::io::ErrorKind::NotFound => {
-                DownloadError::InvalidPath(format!("File not found: {}", err))
+                PacaError::InvalidPath(format!("File not found: {}", err))
             }
-            _ => DownloadError::CacheDir(err),
+            _ => PacaError::CacheDir(err),
         }
     }
 }
