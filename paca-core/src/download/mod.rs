@@ -36,9 +36,6 @@ pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathB
     let blobs = blobs_dir(&hub_dir, &model_ref);
     fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
 
-    let mut paths = Vec::new();
-    let mut commit_hash = None;
-
     let multi = MultiProgress::new();
     let bars: Vec<ProgressBar> = manifest
         .gguf_files
@@ -51,56 +48,80 @@ pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathB
         })
         .collect();
 
-    for (gguf_file, bar) in manifest.gguf_files.iter().zip(bars) {
-        let url = format!(
-            "{}/{}/resolve/main/{}",
-            endpoint,
-            model_ref.repo(),
-            gguf_file.filename
-        );
+    let results: Vec<Result<(PathBuf, String), PacaError>> = thread::scope(|s| {
+        let handles: Vec<_> = manifest
+            .gguf_files
+            .iter()
+            .zip(bars)
+            .map(|(gguf_file, bar)| {
+                let client = &client;
+                let head_client = &head_client;
+                let endpoint = &endpoint;
+                let model_ref = &model_ref;
+                let hub_dir = &hub_dir;
+                let blobs = &blobs;
 
-        let resolve_info = fetch_resolve_info(&head_client, &url)?;
+                s.spawn(move || {
+                    let url = format!(
+                        "{}/{}/resolve/main/{}",
+                        endpoint,
+                        model_ref.repo(),
+                        gguf_file.filename
+                    );
 
+                    let resolve_info = fetch_resolve_info(head_client, &url)?;
+                    let blob_path = blobs.join(&resolve_info.blob_hash);
+
+                    if blob_exists(hub_dir, model_ref, &resolve_info.blob_hash) {
+                        let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
+
+                        if existing_size >= gguf_file.size {
+                            bar.set_style(download_style());
+                            bar.set_position(gguf_file.size);
+                            bar.finish();
+
+                            let symlink_path = create_snapshot_symlink(
+                                hub_dir,
+                                model_ref,
+                                &resolve_info.commit_hash,
+                                &gguf_file.filename,
+                                &resolve_info.blob_hash,
+                            )?;
+                            return Ok((symlink_path, resolve_info.commit_hash));
+                        }
+
+                        download_file(client, &url, &blob_path, existing_size, &bar)?;
+                    } else {
+                        download_file(client, &url, &blob_path, 0, &bar)?;
+                    }
+
+                    let symlink_path = create_snapshot_symlink(
+                        hub_dir,
+                        model_ref,
+                        &resolve_info.commit_hash,
+                        &gguf_file.filename,
+                        &resolve_info.blob_hash,
+                    )?;
+                    Ok((symlink_path, resolve_info.commit_hash))
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("download thread panicked"))
+            .collect()
+    });
+
+    let mut paths = Vec::new();
+    let mut commit_hash = None;
+
+    for result in results {
+        let (path, hash) = result?;
+        paths.push(path);
         if commit_hash.is_none() {
-            commit_hash = Some(resolve_info.commit_hash.clone());
+            commit_hash = Some(hash);
         }
-
-        let snapshot_id = &resolve_info.commit_hash;
-
-        let blob_path = blobs.join(&resolve_info.blob_hash);
-
-        if blob_exists(&hub_dir, &model_ref, &resolve_info.blob_hash) {
-            let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
-
-            if existing_size >= gguf_file.size {
-                bar.set_style(download_style());
-                bar.set_position(gguf_file.size);
-                bar.finish();
-
-                let symlink_path = create_snapshot_symlink(
-                    &hub_dir,
-                    &model_ref,
-                    snapshot_id,
-                    &gguf_file.filename,
-                    &resolve_info.blob_hash,
-                )?;
-                paths.push(symlink_path);
-                continue;
-            }
-
-            download_file(&client, &url, &blob_path, existing_size, &bar)?;
-        } else {
-            download_file(&client, &url, &blob_path, 0, &bar)?;
-        }
-
-        let symlink_path = create_snapshot_symlink(
-            &hub_dir,
-            &model_ref,
-            snapshot_id,
-            &gguf_file.filename,
-            &resolve_info.blob_hash,
-        )?;
-        paths.push(symlink_path);
     }
 
     if let Some(commit) = &commit_hash {
