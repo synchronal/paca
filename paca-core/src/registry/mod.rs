@@ -26,10 +26,10 @@ pub fn default_headers() -> HeaderMap {
     headers.insert("User-Agent", USER_AGENT.parse().unwrap());
 
     if let Ok(token) = env::var("HF_TOKEN") {
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
+        let mut auth_value: reqwest::header::HeaderValue =
+            format!("Bearer {}", token).parse().unwrap();
+        auth_value.set_sensitive(true);
+        headers.insert("Authorization", auth_value);
     }
 
     headers
