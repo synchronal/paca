@@ -15,6 +15,7 @@ use crate::registry::default_headers;
 use crate::registry::endpoint::get_model_endpoint;
 use crate::registry::manifest::fetch_manifest;
 use crate::registry::{fetch_resolve_info, resolve_client};
+use crate::sysinfo::check_disk_space;
 
 /// Downloads a GGUF model from HuggingFace into the HF Hub cache format
 pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, PacaError> {
@@ -35,6 +36,9 @@ pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathB
 
     let blobs = blobs_dir(&hub_dir, &model_ref);
     fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
+
+    let total_size: u64 = manifest.gguf_files.iter().map(|f| f.size).sum();
+    check_disk_space(&blobs, total_size)?;
 
     let multi = MultiProgress::new();
     let bars: Vec<ProgressBar> = manifest

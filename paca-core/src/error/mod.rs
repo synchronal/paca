@@ -43,6 +43,10 @@ pub enum PacaError {
     #[error("{0}")]
     ModelRef(#[from] ModelRefError),
 
+    /// Insufficient disk space for download
+    #[error("Insufficient disk space: need {needed} bytes but only {available} bytes available")]
+    InsufficientDiskSpace { needed: u64, available: u64 },
+
     /// Rate limited by the server (429), with optional Retry-After seconds
     #[error("Rate limited (retry after {0}s)")]
     RateLimited(u64),

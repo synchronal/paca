@@ -5,3 +5,4 @@ pub mod download;
 pub mod error;
 pub mod model;
 pub(crate) mod registry;
+pub mod sysinfo;

@@ -13,6 +13,7 @@ version.workspace = true
 [dependencies]
 dirs.workspace = true
 indicatif.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
