@@ -4,7 +4,7 @@ pub mod cli;
 use cli::Cli;
 
 /// Executes the command-line interface logic
-pub fn run(cli: Cli) -> anyhow::Result<()> {
+pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Clean(args) => {
             let result = paca_core::cache::clean::clean_cache(args.hub_dir)?;
@@ -17,7 +17,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Download(args) => {
-            let paths = paca_core::download::download_model(&args.model, args.hub_dir)?;
+            let paths = paca_core::download::download_model(&args.model, args.hub_dir).await?;
             for path in &paths {
                 println!("{}", path.display());
             }
@@ -36,7 +36,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Outdated(args) => {
-            let outdated = paca_core::cache::check_outdated_models(args.hub_dir)?;
+            let outdated = paca_core::cache::check_outdated_models(args.hub_dir).await?;
             if outdated.is_empty() {
                 println!("All downloaded models are up to date.");
             } else {

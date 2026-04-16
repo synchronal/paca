@@ -1,13 +1,12 @@
 pub use crate::error::PacaError;
 
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::blocking::Client;
+use reqwest::Client;
 
 use crate::cache::{blob_exists, blobs_dir, get_hub_dir, save_ref, snapshots_dir};
 use crate::model::ModelRef;
@@ -18,7 +17,10 @@ use crate::registry::{fetch_resolve_info, resolve_client};
 use crate::sysinfo::check_disk_space;
 
 /// Downloads a GGUF model from HuggingFace into the HF Hub cache format
-pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, PacaError> {
+pub async fn download_model(
+    model: &str,
+    hub_dir: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, PacaError> {
     let model_ref: ModelRef = model.parse()?;
     let headers = default_headers();
     let client = Client::builder()
@@ -26,7 +28,7 @@ pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathB
         .tcp_keepalive(Duration::from_secs(15))
         .build()?;
 
-    let manifest = fetch_manifest(&client, &model_ref)?;
+    let manifest = fetch_manifest(&client, &model_ref).await?;
     let hub_dir = match hub_dir {
         Some(dir) => {
             fs::create_dir_all(&dir).map_err(PacaError::CacheDir)?;
@@ -55,79 +57,70 @@ pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathB
         })
         .collect();
 
-    let results: Vec<Result<(PathBuf, String), PacaError>> = thread::scope(|s| {
-        let handles: Vec<_> = manifest
-            .gguf_files
-            .iter()
-            .zip(bars)
-            .map(|(gguf_file, bar)| {
-                let client = &client;
-                let head_client = &head_client;
-                let endpoint = &endpoint;
-                let model_ref = &model_ref;
-                let hub_dir = &hub_dir;
-                let blobs = &blobs;
+    let mut set: tokio::task::JoinSet<Result<(PathBuf, String), PacaError>> =
+        tokio::task::JoinSet::new();
 
-                s.spawn(move || {
-                    let url = format!(
-                        "{}/{}/resolve/main/{}",
-                        endpoint,
-                        model_ref.repo(),
-                        gguf_file.filename
-                    );
+    for (gguf_file, bar) in manifest.gguf_files.into_iter().zip(bars) {
+        let client = client.clone();
+        let head_client = head_client.clone();
+        let endpoint = endpoint.clone();
+        let model_ref = model_ref.clone();
+        let hub_dir = hub_dir.clone();
+        let blobs = blobs.clone();
 
-                    let resolve_info = fetch_resolve_info(head_client, &url)?;
-                    let blob_path = blobs.join(&resolve_info.blob_hash);
+        set.spawn(async move {
+            let url = format!(
+                "{}/{}/resolve/main/{}",
+                endpoint,
+                model_ref.repo(),
+                gguf_file.filename
+            );
 
-                    if blob_exists(hub_dir, model_ref, &resolve_info.blob_hash) {
-                        let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
+            let resolve_info = fetch_resolve_info(&head_client, &url).await?;
+            let blob_path = blobs.join(&resolve_info.blob_hash);
 
-                        if existing_size >= gguf_file.size {
-                            bar.set_style(download_style());
-                            bar.set_position(gguf_file.size);
-                            bar.finish();
+            if blob_exists(&hub_dir, &model_ref, &resolve_info.blob_hash) {
+                let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
 
-                            let symlink_path = create_snapshot_symlink(
-                                hub_dir,
-                                model_ref,
-                                &resolve_info.commit_hash,
-                                &gguf_file.filename,
-                                &resolve_info.blob_hash,
-                            )?;
-                            return Ok((symlink_path, resolve_info.commit_hash));
-                        }
-
-                        // Partial blob exists — resume with single connection
-                        download_file(client, &url, &blob_path, existing_size, &bar)?;
-                    } else if gguf_file.size >= PARALLEL_THRESHOLD {
-                        download_file_parallel(client, &url, &blob_path, gguf_file.size, &bar)?;
-                    } else {
-                        download_file(client, &url, &blob_path, 0, &bar)?;
-                    }
+                if existing_size >= gguf_file.size {
+                    bar.set_style(download_style());
+                    bar.set_position(gguf_file.size);
+                    bar.finish();
 
                     let symlink_path = create_snapshot_symlink(
-                        hub_dir,
-                        model_ref,
+                        &hub_dir,
+                        &model_ref,
                         &resolve_info.commit_hash,
                         &gguf_file.filename,
                         &resolve_info.blob_hash,
                     )?;
-                    Ok((symlink_path, resolve_info.commit_hash))
-                })
-            })
-            .collect();
+                    return Ok((symlink_path, resolve_info.commit_hash));
+                }
 
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("download thread panicked"))
-            .collect()
-    });
+                // Partial blob exists — resume with single connection
+                download_file(&client, &url, &blob_path, existing_size, &bar).await?;
+            } else if gguf_file.size >= PARALLEL_THRESHOLD {
+                download_file_parallel(&client, &url, &blob_path, gguf_file.size, &bar).await?;
+            } else {
+                download_file(&client, &url, &blob_path, 0, &bar).await?;
+            }
+
+            let symlink_path = create_snapshot_symlink(
+                &hub_dir,
+                &model_ref,
+                &resolve_info.commit_hash,
+                &gguf_file.filename,
+                &resolve_info.blob_hash,
+            )?;
+            Ok((symlink_path, resolve_info.commit_hash))
+        });
+    }
 
     let mut paths = Vec::new();
     let mut commit_hash = None;
 
-    for result in results {
-        let (path, hash) = result?;
+    while let Some(result) = set.join_next().await {
+        let (path, hash) = result.expect("download task panicked")?;
         paths.push(path);
         if commit_hash.is_none() {
             commit_hash = Some(hash);
@@ -171,7 +164,7 @@ fn create_snapshot_symlink(
 
 const MAX_RETRIES: u32 = 5;
 
-fn download_file(
+async fn download_file(
     client: &Client,
     url: &str,
     path: &Path,
@@ -182,7 +175,7 @@ fn download_file(
     let mut bytes_on_disk = resume_from;
 
     loop {
-        match attempt_download(client, url, path, bytes_on_disk, progress_bar) {
+        match attempt_download(client, url, path, bytes_on_disk, progress_bar).await {
             Ok(()) => return Ok(()),
             Err(e) if is_retryable(&e) => {
                 let new_size = fs::metadata(path).map(|m| m.len()).unwrap_or(bytes_on_disk);
@@ -205,7 +198,7 @@ fn download_file(
                 progress_bar.println(format!(
                     "Download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
                 ));
-                thread::sleep(Duration::from_secs(delay_secs));
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             }
             Err(e) => return Err(e),
         }
@@ -227,7 +220,7 @@ fn is_retryable(error: &PacaError) -> bool {
     }
 }
 
-fn attempt_download(
+async fn attempt_download(
     client: &Client,
     url: &str,
     path: &Path,
@@ -240,7 +233,7 @@ fn attempt_download(
         request = request.header("Range", format!("bytes={}-", resume_from));
     }
 
-    let response = request.send()?;
+    let response = request.send().await?;
 
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let retry_after = response
@@ -272,21 +265,13 @@ fn attempt_download(
     progress_bar.set_style(download_style());
     progress_bar.set_position(start_pos);
 
-    let mut buffer = [0u8; 1_048_576];
-
-    loop {
-        match response.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(bytes_read) => {
-                file.write_all(&buffer[..bytes_read])
-                    .map_err(PacaError::FileWrite)?;
-                progress_bar.inc(bytes_read as u64);
-            }
-            Err(e) => {
-                let _ = file.flush();
-                return Err(PacaError::Download(e));
-            }
-        }
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| PacaError::Download(std::io::Error::other(e)))?
+    {
+        file.write_all(&chunk).map_err(PacaError::FileWrite)?;
+        progress_bar.inc(chunk.len() as u64);
     }
 
     file.flush().map_err(PacaError::FileWrite)?;
@@ -301,7 +286,7 @@ const PARALLEL_THRESHOLD: u64 = 100 * 1024 * 1024;
 /// Number of concurrent connections per file
 const CHUNK_COUNT: usize = 4;
 
-fn download_file_parallel(
+async fn download_file_parallel(
     client: &Client,
     url: &str,
     path: &Path,
@@ -317,27 +302,26 @@ fn download_file_parallel(
     progress_bar.set_style(download_style());
     progress_bar.set_position(0);
 
-    let result: Result<(), PacaError> = thread::scope(|s| {
-        let handles: Vec<_> = chunks
-            .into_iter()
-            .map(|(start, end)| {
-                s.spawn(move || download_chunk(client, url, path, start, end, progress_bar))
-            })
-            .collect();
+    let mut set = tokio::task::JoinSet::new();
 
-        for handle in handles {
-            handle.join().expect("chunk download thread panicked")?;
-        }
+    for (start, end) in chunks {
+        let client = client.clone();
+        let url = url.to_string();
+        let path = path.to_path_buf();
+        let bar = progress_bar.clone();
 
-        Ok(())
-    });
+        set.spawn(async move { download_chunk(&client, &url, &path, start, end, &bar).await });
+    }
 
-    result?;
+    while let Some(result) = set.join_next().await {
+        result.expect("chunk download task panicked")?;
+    }
+
     progress_bar.finish();
     Ok(())
 }
 
-fn download_chunk(
+async fn download_chunk(
     client: &Client,
     url: &str,
     path: &Path,
@@ -351,7 +335,7 @@ fn download_chunk(
 
     loop {
         let current_start = start + bytes_written;
-        match attempt_chunk_download(client, url, path, current_start, end, progress_bar) {
+        match attempt_chunk_download(client, url, path, current_start, end, progress_bar).await {
             Ok(()) => return Ok(()),
             Err(e) if is_retryable(&e) => {
                 let new_bytes = chunk_bytes_on_disk(path, start, chunk_size);
@@ -373,7 +357,7 @@ fn download_chunk(
                 progress_bar.println(format!(
                     "Chunk download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
                 ));
-                thread::sleep(Duration::from_secs(delay_secs));
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             }
             Err(e) => return Err(e),
         }
@@ -389,7 +373,7 @@ fn chunk_bytes_on_disk(path: &Path, start: u64, chunk_size: u64) -> u64 {
     }
 }
 
-fn attempt_chunk_download(
+async fn attempt_chunk_download(
     client: &Client,
     url: &str,
     path: &Path,
@@ -400,7 +384,8 @@ fn attempt_chunk_download(
     let response = client
         .get(url)
         .header("Range", format!("bytes={}-{}", start, end))
-        .send()?;
+        .send()
+        .await?;
 
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let retry_after = response
@@ -421,21 +406,13 @@ fn attempt_chunk_download(
     file.seek(std::io::SeekFrom::Start(start))
         .map_err(PacaError::FileWrite)?;
 
-    let mut buffer = [0u8; 1_048_576];
-
-    loop {
-        match response.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(bytes_read) => {
-                file.write_all(&buffer[..bytes_read])
-                    .map_err(PacaError::FileWrite)?;
-                progress_bar.inc(bytes_read as u64);
-            }
-            Err(e) => {
-                let _ = file.flush();
-                return Err(PacaError::Download(e));
-            }
-        }
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| PacaError::Download(std::io::Error::other(e)))?
+    {
+        file.write_all(&chunk).map_err(PacaError::FileWrite)?;
+        progress_bar.inc(chunk.len() as u64);
     }
 
     file.flush().map_err(PacaError::FileWrite)?;
@@ -517,9 +494,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn download_model_returns_error_for_missing_tag() {
-        let result = download_model("owner/model", None);
+    #[tokio::test]
+    async fn download_model_returns_error_for_missing_tag() {
+        let result = download_model("owner/model", None).await;
         assert!(result.is_err());
     }
 

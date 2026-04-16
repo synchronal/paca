@@ -18,6 +18,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 paca-core.workspace = true
+tokio.workspace = true
 
 [features]
 strict = [] # Treat warnings as a build error.

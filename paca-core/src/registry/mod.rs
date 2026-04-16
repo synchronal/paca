@@ -3,7 +3,7 @@ pub mod manifest;
 
 use std::env;
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 use reqwest::header::HeaderMap;
 use reqwest::redirect;
 
@@ -43,8 +43,8 @@ pub fn resolve_client() -> Result<Client, PacaError> {
         .build()?)
 }
 
-pub fn fetch_resolve_info(client: &Client, url: &str) -> Result<ResolveInfo, PacaError> {
-    let response = client.head(url).send()?;
+pub async fn fetch_resolve_info(client: &Client, url: &str) -> Result<ResolveInfo, PacaError> {
+    let response = client.head(url).send().await?;
     let headers = response.headers();
 
     let commit_hash = headers

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::Deserialize;
 
 use crate::error::PacaError;
@@ -43,7 +43,7 @@ pub struct Manifest {
 }
 
 /// Fetches the model manifest from HuggingFace, handling both single and sharded files
-pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, PacaError> {
+pub async fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, PacaError> {
     let endpoint = get_model_endpoint();
     let url = format!(
         "{}/v2/{}/manifests/{}",
@@ -52,9 +52,9 @@ pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest,
         model_ref.tag
     );
 
-    let response = client.get(&url).send()?.error_for_status()?;
+    let response = client.get(&url).send().await?.error_for_status()?;
 
-    let parsed: serde_json::Value = response.json()?;
+    let parsed: serde_json::Value = response.json().await?;
     let discovered = collect_manifest_files(&parsed);
 
     if discovered.is_empty() {
@@ -65,12 +65,8 @@ pub fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest,
     for file in discovered {
         match shard_count(&file.filename) {
             Some(_) => {
-                gguf_files.extend(fetch_tree_files(
-                    client,
-                    &endpoint,
-                    model_ref,
-                    &file.filename,
-                )?);
+                gguf_files
+                    .extend(fetch_tree_files(client, &endpoint, model_ref, &file.filename).await?);
             }
             None => gguf_files.push(file),
         }
@@ -108,7 +104,7 @@ fn collect_manifest_files(value: &serde_json::Value) -> Vec<GgufFile> {
 }
 
 /// Fetches sharded GGUF files from the HuggingFace tree API
-fn fetch_tree_files(
+async fn fetch_tree_files(
     client: &Client,
     endpoint: &str,
     model_ref: &ModelRef,
@@ -123,9 +119,9 @@ fn fetch_tree_files(
         subdir
     );
 
-    let response = client.get(&url).send()?.error_for_status()?;
+    let response = client.get(&url).send().await?.error_for_status()?;
 
-    let entries: Vec<TreeEntry> = response.json()?;
+    let entries: Vec<TreeEntry> = response.json().await?;
 
     let mut gguf_files: Vec<GgufFile> = entries
         .into_iter()

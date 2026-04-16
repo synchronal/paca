@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 
 use crate::model::ModelRef;
 use crate::registry::default_headers;
@@ -241,7 +241,7 @@ fn parse_model_dir_name(dir_name: &str) -> Option<(String, String)> {
 ///
 /// Groups models by repo so that only one resolve-info HEAD request is made per
 /// repo, regardless of how many tags are installed.
-pub fn check_outdated_models(
+pub async fn check_outdated_models(
     hub_dir: Option<PathBuf>,
 ) -> Result<Vec<OutdatedModelInfo>, PacaError> {
     let hub_dir = match hub_dir {
@@ -273,7 +273,8 @@ pub fn check_outdated_models(
             Some(&val) => val,
             None => {
                 let outdated =
-                    check_repo_outdated(&client, &head_client, &endpoint, &hub_dir, model_ref)?;
+                    check_repo_outdated(&client, &head_client, &endpoint, &hub_dir, model_ref)
+                        .await?;
                 repo_outdated.insert(repo, outdated);
                 outdated
             }
@@ -283,7 +284,7 @@ pub fn check_outdated_models(
             continue;
         }
 
-        let manifest = fetch_manifest(&client, model_ref)?;
+        let manifest = fetch_manifest(&client, model_ref).await?;
         let local_commit = read_ref(&hub_dir, model_ref);
         let snapshot_path =
             snapshots_dir(&hub_dir, model_ref).join(local_commit.as_deref().unwrap_or(""));
@@ -302,14 +303,14 @@ pub fn check_outdated_models(
     Ok(outdated_models)
 }
 
-fn check_repo_outdated(
+async fn check_repo_outdated(
     client: &Client,
     head_client: &Client,
     endpoint: &str,
     hub_dir: &Path,
     model_ref: &ModelRef,
 ) -> Result<bool, PacaError> {
-    let manifest = fetch_manifest(client, model_ref)?;
+    let manifest = fetch_manifest(client, model_ref).await?;
     let first_file = match manifest.gguf_files.first() {
         Some(f) => f,
         None => return Ok(false),
@@ -324,7 +325,7 @@ fn check_repo_outdated(
 
     let local_commit = read_ref(hub_dir, model_ref);
 
-    match fetch_resolve_info(head_client, &url) {
+    match fetch_resolve_info(head_client, &url).await {
         Ok(info) => Ok(local_commit.as_deref() != Some(&info.commit_hash)),
         Err(_) => Ok(false),
     }
