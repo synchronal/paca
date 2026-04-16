@@ -43,6 +43,10 @@ pub enum PacaError {
     #[error("{0}")]
     ModelRef(#[from] ModelRefError),
 
+    /// Rate limited by the server (429), with optional Retry-After seconds
+    #[error("Rate limited (retry after {0}s)")]
+    RateLimited(u64),
+
     /// Invalid path format
     #[error("Invalid path: {0}")]
     InvalidPath(String),

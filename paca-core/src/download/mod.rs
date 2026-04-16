@@ -188,7 +188,10 @@ fn download_file(
                     return Err(e);
                 }
 
-                let delay_secs = 1u64 << retries;
+                let delay_secs = match &e {
+                    PacaError::RateLimited(wait) if *wait > 0 => *wait,
+                    _ => 1u64 << retries,
+                };
                 progress_bar.println(format!(
                     "Download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
                 ));
@@ -209,6 +212,7 @@ fn is_retryable(error: &PacaError) -> bool {
                 true
             }
         }
+        PacaError::RateLimited(_) => true,
         _ => false,
     }
 }
@@ -226,7 +230,19 @@ fn attempt_download(
         request = request.header("Range", format!("bytes={}-", resume_from));
     }
 
-    let mut response = request.send()?.error_for_status()?;
+    let response = request.send()?;
+
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        return Err(PacaError::RateLimited(retry_after));
+    }
+
+    let mut response = response.error_for_status()?;
 
     let is_partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
 
@@ -283,6 +299,16 @@ fn download_style() -> ProgressStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_retryable_returns_true_for_rate_limited() {
+        assert!(is_retryable(&PacaError::RateLimited(30)));
+    }
+
+    #[test]
+    fn is_retryable_returns_true_for_rate_limited_without_retry_after() {
+        assert!(is_retryable(&PacaError::RateLimited(0)));
+    }
 
     #[test]
     fn download_model_returns_error_for_missing_tag() {
