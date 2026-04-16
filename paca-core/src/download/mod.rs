@@ -1,7 +1,7 @@
 pub use crate::error::PacaError;
 
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -97,7 +97,10 @@ pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathB
                             return Ok((symlink_path, resolve_info.commit_hash));
                         }
 
+                        // Partial blob exists — resume with single connection
                         download_file(client, &url, &blob_path, existing_size, &bar)?;
+                    } else if gguf_file.size >= PARALLEL_THRESHOLD {
+                        download_file_parallel(client, &url, &blob_path, gguf_file.size, &bar)?;
                     } else {
                         download_file(client, &url, &blob_path, 0, &bar)?;
                     }
@@ -292,6 +295,168 @@ fn attempt_download(
     Ok(())
 }
 
+/// Minimum file size to use parallel chunk downloads (100 MB)
+const PARALLEL_THRESHOLD: u64 = 100 * 1024 * 1024;
+
+/// Number of concurrent connections per file
+const CHUNK_COUNT: usize = 4;
+
+fn download_file_parallel(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    total_size: u64,
+    progress_bar: &ProgressBar,
+) -> Result<(), PacaError> {
+    let chunks = calculate_chunks(total_size, CHUNK_COUNT);
+
+    let file = File::create(path).map_err(PacaError::FileWrite)?;
+    file.set_len(total_size).map_err(PacaError::FileWrite)?;
+    drop(file);
+
+    progress_bar.set_style(download_style());
+    progress_bar.set_position(0);
+
+    let result: Result<(), PacaError> = thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|(start, end)| {
+                s.spawn(move || download_chunk(client, url, path, start, end, progress_bar))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("chunk download thread panicked")?;
+        }
+
+        Ok(())
+    });
+
+    result?;
+    progress_bar.finish();
+    Ok(())
+}
+
+fn download_chunk(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    start: u64,
+    end: u64,
+    progress_bar: &ProgressBar,
+) -> Result<(), PacaError> {
+    let mut retries: u32 = 0;
+    let mut bytes_written: u64 = 0;
+    let chunk_size = end - start + 1;
+
+    loop {
+        let current_start = start + bytes_written;
+        match attempt_chunk_download(client, url, path, current_start, end, progress_bar) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_retryable(&e) => {
+                let new_bytes = chunk_bytes_on_disk(path, start, chunk_size);
+                if new_bytes > bytes_written {
+                    retries = 0;
+                    bytes_written = new_bytes;
+                } else {
+                    retries += 1;
+                }
+
+                if retries > MAX_RETRIES {
+                    return Err(e);
+                }
+
+                let delay_secs = match &e {
+                    PacaError::RateLimited(wait) if *wait > 0 => *wait,
+                    _ => 1u64 << retries,
+                };
+                progress_bar.println(format!(
+                    "Chunk download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
+                ));
+                thread::sleep(Duration::from_secs(delay_secs));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn chunk_bytes_on_disk(path: &Path, start: u64, chunk_size: u64) -> u64 {
+    let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if file_size <= start {
+        0
+    } else {
+        (file_size - start).min(chunk_size)
+    }
+}
+
+fn attempt_chunk_download(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    start: u64,
+    end: u64,
+    progress_bar: &ProgressBar,
+) -> Result<(), PacaError> {
+    let response = client
+        .get(url)
+        .header("Range", format!("bytes={}-{}", start, end))
+        .send()?;
+
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        return Err(PacaError::RateLimited(retry_after));
+    }
+
+    let mut response = response.error_for_status()?;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(PacaError::FileWrite)?;
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(PacaError::FileWrite)?;
+
+    let mut buffer = [0u8; 1_048_576];
+
+    loop {
+        match response.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                file.write_all(&buffer[..bytes_read])
+                    .map_err(PacaError::FileWrite)?;
+                progress_bar.inc(bytes_read as u64);
+            }
+            Err(e) => {
+                let _ = file.flush();
+                return Err(PacaError::Download(e));
+            }
+        }
+    }
+
+    file.flush().map_err(PacaError::FileWrite)?;
+    Ok(())
+}
+
+fn calculate_chunks(total_size: u64, count: usize) -> Vec<(u64, u64)> {
+    let chunk_size = total_size / count as u64;
+    (0..count)
+        .map(|i| {
+            let start = i as u64 * chunk_size;
+            let end = if i == count - 1 {
+                total_size - 1
+            } else {
+                (i as u64 + 1) * chunk_size - 1
+            };
+            (start, end)
+        })
+        .collect()
+}
+
 fn pending_style() -> ProgressStyle {
     ProgressStyle::default_bar().template("{msg}").unwrap()
 }
@@ -315,6 +480,41 @@ mod tests {
     #[test]
     fn is_retryable_returns_true_for_rate_limited_without_retry_after() {
         assert!(is_retryable(&PacaError::RateLimited(0)));
+    }
+
+    #[test]
+    fn calculate_chunks_divides_evenly() {
+        let chunks = calculate_chunks(100, 4);
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0], (0, 24));
+        assert_eq!(chunks[1], (25, 49));
+        assert_eq!(chunks[2], (50, 74));
+        assert_eq!(chunks[3], (75, 99));
+    }
+
+    #[test]
+    fn calculate_chunks_last_chunk_absorbs_remainder() {
+        let chunks = calculate_chunks(10, 3);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], (0, 2));
+        assert_eq!(chunks[1], (3, 5));
+        assert_eq!(chunks[2], (6, 9));
+    }
+
+    #[test]
+    fn calculate_chunks_covers_entire_file() {
+        let total_size = 1_048_576u64;
+        let chunks = calculate_chunks(total_size, 4);
+        let total_bytes: u64 = chunks.iter().map(|(start, end)| end - start + 1).sum();
+        assert_eq!(total_bytes, total_size);
+    }
+
+    #[test]
+    fn calculate_chunks_has_no_gaps() {
+        let chunks = calculate_chunks(1000, 4);
+        for i in 1..chunks.len() {
+            assert_eq!(chunks[i].0, chunks[i - 1].1 + 1);
+        }
     }
 
     #[test]
