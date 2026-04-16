@@ -269,7 +269,7 @@ fn attempt_download(
     progress_bar.set_style(download_style());
     progress_bar.set_position(start_pos);
 
-    let mut buffer = [0u8; 131072];
+    let mut buffer = [0u8; 1_048_576];
 
     loop {
         match response.read(&mut buffer) {
