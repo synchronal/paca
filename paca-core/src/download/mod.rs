@@ -21,7 +21,10 @@ use crate::sysinfo::check_disk_space;
 pub fn download_model(model: &str, hub_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, PacaError> {
     let model_ref: ModelRef = model.parse()?;
     let headers = default_headers();
-    let client = Client::builder().default_headers(headers).build()?;
+    let client = Client::builder()
+        .default_headers(headers)
+        .tcp_keepalive(Duration::from_secs(15))
+        .build()?;
 
     let manifest = fetch_manifest(&client, &model_ref)?;
     let hub_dir = match hub_dir {
