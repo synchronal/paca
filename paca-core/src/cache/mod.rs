@@ -119,7 +119,7 @@ pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelInfo>, PacaError
         list_snapshot_models(&dir_name, &entry.path(), &mut models)?;
     }
 
-    models.sort_by(|a, b| a.model_ref.to_string().cmp(&b.model_ref.to_string()));
+    models.sort_by_key(|a| a.model_ref.to_string());
 
     Ok(models)
 }
@@ -298,7 +298,7 @@ pub async fn check_outdated_models(
         }
     }
 
-    outdated_models.sort_by(|a, b| a.model_ref.to_string().cmp(&b.model_ref.to_string()));
+    outdated_models.sort_by_key(|a| a.model_ref.to_string());
 
     Ok(outdated_models)
 }
