@@ -45,6 +45,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        cli::Commands::Remove(args) => {
+            let result = paca_core::cache::remove::remove_model(&args.target, args.hub_dir)?;
+            for path in &result.removed_files {
+                println!("{}", path.display());
+            }
+        }
     }
     Ok(())
 }
@@ -52,7 +58,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ModelArgs;
+    use crate::cli::{ModelArgs, RemoveArgs};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -155,5 +161,59 @@ mod tests {
                 hub_dir: Some(PathBuf::from("/tmp/models")),
             })
         );
+    }
+
+    #[test]
+    fn cli_parses_remove_subcommand() {
+        let result = Cli::try_parse_from(["paca", "remove", "owner/model:tag"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Remove(RemoveArgs {
+                hub_dir: None,
+                target: String::from("owner/model:tag"),
+            })
+        );
+    }
+
+    #[test]
+    fn cli_parses_rm_alias() {
+        let result = Cli::try_parse_from(["paca", "rm", "owner/model"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Remove(RemoveArgs {
+                hub_dir: None,
+                target: String::from("owner/model"),
+            })
+        );
+    }
+
+    #[test]
+    fn cli_parses_remove_with_hub_dir() {
+        let result = Cli::try_parse_from([
+            "paca",
+            "remove",
+            "--hub-dir",
+            "/tmp/models",
+            "owner/model:tag",
+        ]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert_eq!(
+            cli.command,
+            cli::Commands::Remove(RemoveArgs {
+                hub_dir: Some(PathBuf::from("/tmp/models")),
+                target: String::from("owner/model:tag"),
+            })
+        );
+    }
+
+    #[test]
+    fn cli_parses_remove_requires_target_argument() {
+        let result = Cli::try_parse_from(["paca", "remove"]);
+        assert!(result.is_err());
     }
 }

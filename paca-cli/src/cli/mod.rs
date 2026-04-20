@@ -23,6 +23,9 @@ pub enum Commands {
     List(CommonArgs),
     /// Check which downloaded models have outdated files
     Outdated(CommonArgs),
+    /// Remove a downloaded model or tag
+    #[command(aliases = ["rm"])]
+    Remove(RemoveArgs),
     /// Print version information
     Version,
 }
@@ -42,4 +45,14 @@ pub struct ModelArgs {
 
     /// Model identifier (e.g., unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL)
     pub model: String,
+}
+
+#[derive(Args, Debug, PartialEq)]
+pub struct RemoveArgs {
+    /// Override the HuggingFace Hub cache directory
+    #[arg(long)]
+    pub hub_dir: Option<PathBuf>,
+
+    /// Model repository or tag (e.g., unsloth/GLM-4.7-Flash-GGUF or unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL)
+    pub target: String,
 }

@@ -1,4 +1,5 @@
 pub mod clean;
+pub mod remove;
 
 pub use crate::error::PacaError;
 
@@ -208,7 +209,7 @@ fn collect_gguf_tags_recursive(
 ///
 /// Strips the model base name prefix (model name without `-GGUF`), the `.gguf`
 /// suffix, and any shard suffix (e.g. `-00001-of-00002`).
-fn derive_tag(filename: &str, model: &str) -> Option<String> {
+pub(crate) fn derive_tag(filename: &str, model: &str) -> Option<String> {
     let stem = filename.strip_suffix(".gguf")?;
     let model_base = model.strip_suffix("-GGUF")?;
     let remainder = stem.strip_prefix(model_base)?.strip_prefix('-')?;
@@ -231,7 +232,7 @@ fn derive_tag(filename: &str, model: &str) -> Option<String> {
     Some(tag.to_string())
 }
 
-fn parse_model_dir_name(dir_name: &str) -> Option<(String, String)> {
+pub(crate) fn parse_model_dir_name(dir_name: &str) -> Option<(String, String)> {
     let stripped = dir_name.strip_prefix("models--")?;
     let (owner, model) = stripped.split_once("--")?;
     Some((owner.to_string(), model.to_string()))

@@ -39,6 +39,10 @@ pub enum PacaError {
     #[error("Missing x-repo-commit header for: {0}")]
     MissingCommitHash(String),
 
+    /// Model is not installed in the cache
+    #[error("Model not installed: {0}")]
+    ModelNotInstalled(String),
+
     /// Invalid model reference format
     #[error("{0}")]
     ModelRef(#[from] ModelRefError),
