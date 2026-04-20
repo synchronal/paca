@@ -22,11 +22,7 @@ pub async fn download_model(
     hub_dir: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>, PacaError> {
     let model_ref: ModelRef = model.parse()?;
-    let headers = default_headers();
-    let client = Client::builder()
-        .default_headers(headers)
-        .tcp_keepalive(Duration::from_secs(15))
-        .build()?;
+    let client = build_download_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)?;
 
     let manifest = fetch_manifest(&client, &model_ref).await?;
     let hub_dir = match hub_dir {
@@ -82,7 +78,7 @@ pub async fn download_model(
             if blob_exists(&hub_dir, &model_ref, &resolve_info.blob_hash) {
                 let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
 
-                if existing_size >= gguf_file.size {
+                if blob_is_complete(existing_size, gguf_file.size) {
                     bar.set_style(download_style());
                     bar.set_position(gguf_file.size);
                     bar.finish();
@@ -97,13 +93,21 @@ pub async fn download_model(
                     return Ok((symlink_path, resolve_info.commit_hash));
                 }
 
-                // Partial blob exists — resume with single connection
-                download_file(&client, &url, &blob_path, existing_size, &bar).await?;
-            } else if gguf_file.size >= PARALLEL_THRESHOLD {
-                download_file_parallel(&client, &url, &blob_path, gguf_file.size, &bar).await?;
+                if existing_size > gguf_file.size {
+                    // Oversized blob on disk — evidence of a corrupt prior run
+                    // (e.g. a parallel chunk that wrote past its range). Delete
+                    // and start fresh rather than trusting it.
+                    fs::remove_file(&blob_path).map_err(PacaError::FileDelete)?;
+                    fresh_download(&client, &url, &blob_path, gguf_file.size, &bar).await?;
+                } else {
+                    // Partial blob exists — resume with single connection
+                    download_file(&client, &url, &blob_path, existing_size, &bar).await?;
+                }
             } else {
-                download_file(&client, &url, &blob_path, 0, &bar).await?;
+                fresh_download(&client, &url, &blob_path, gguf_file.size, &bar).await?;
             }
+
+            verify_file_size(&blob_path, gguf_file.size)?;
 
             let symlink_path = create_snapshot_symlink(
                 &hub_dir,
@@ -215,6 +219,7 @@ fn is_retryable(error: &PacaError) -> bool {
                 true
             }
         }
+        PacaError::RangeNotHonored(_) => true,
         PacaError::RateLimited(_) => true,
         _ => false,
     }
@@ -336,16 +341,34 @@ async fn download_chunk(
     loop {
         let current_start = start + bytes_written;
         match attempt_chunk_download(client, url, path, current_start, end, progress_bar).await {
-            Ok(()) => return Ok(()),
-            Err(e) if is_retryable(&e) => {
-                let new_bytes = chunk_bytes_on_disk(path, start, chunk_size);
-                if new_bytes > bytes_written {
+            Ok(received) => {
+                bytes_written += received;
+                if bytes_written >= chunk_size {
+                    return Ok(());
+                }
+
+                // Server closed early without delivering the full range.
+                // Treat making any progress as a reset for the retry counter.
+                if received > 0 {
                     retries = 0;
-                    bytes_written = new_bytes;
                 } else {
                     retries += 1;
                 }
 
+                if retries > MAX_RETRIES {
+                    return Err(PacaError::Download(std::io::Error::other(
+                        "server closed connection before delivering the full chunk",
+                    )));
+                }
+
+                let delay_secs = 1u64 << retries;
+                progress_bar.println(format!(
+                    "Chunk ended early ({bytes_written}/{chunk_size} bytes). Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
+                ));
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            }
+            Err(e) if is_retryable(&e) => {
+                retries += 1;
                 if retries > MAX_RETRIES {
                     return Err(e);
                 }
@@ -364,15 +387,6 @@ async fn download_chunk(
     }
 }
 
-fn chunk_bytes_on_disk(path: &Path, start: u64, chunk_size: u64) -> u64 {
-    let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if file_size <= start {
-        0
-    } else {
-        (file_size - start).min(chunk_size)
-    }
-}
-
 async fn attempt_chunk_download(
     client: &Client,
     url: &str,
@@ -380,7 +394,7 @@ async fn attempt_chunk_download(
     start: u64,
     end: u64,
     progress_bar: &ProgressBar,
-) -> Result<(), PacaError> {
+) -> Result<u64, PacaError> {
     let response = client
         .get(url)
         .header("Range", format!("bytes={}-{}", start, end))
@@ -397,7 +411,13 @@ async fn attempt_chunk_download(
         return Err(PacaError::RateLimited(retry_after));
     }
 
-    let mut response = response.error_for_status()?;
+    let response = response.error_for_status()?;
+
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(PacaError::RangeNotHonored(response.status().as_u16()));
+    }
+
+    let mut response = response;
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -406,6 +426,7 @@ async fn attempt_chunk_download(
     file.seek(std::io::SeekFrom::Start(start))
         .map_err(PacaError::FileWrite)?;
 
+    let mut bytes_received: u64 = 0;
     while let Some(chunk) = response
         .chunk()
         .await
@@ -413,10 +434,11 @@ async fn attempt_chunk_download(
     {
         file.write_all(&chunk).map_err(PacaError::FileWrite)?;
         progress_bar.inc(chunk.len() as u64);
+        bytes_received += chunk.len() as u64;
     }
 
     file.flush().map_err(PacaError::FileWrite)?;
-    Ok(())
+    Ok(bytes_received)
 }
 
 fn calculate_chunks(total_size: u64, count: usize) -> Vec<(u64, u64)> {
@@ -434,6 +456,51 @@ fn calculate_chunks(total_size: u64, count: usize) -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// Connection establishment timeout for chunk downloads.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-read timeout — fires if the server goes silent mid-response,
+/// which is the "hang" mode we've seen in the wild.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn build_download_client(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<Client, PacaError> {
+    Ok(Client::builder()
+        .connect_timeout(connect_timeout)
+        .default_headers(default_headers())
+        .read_timeout(read_timeout)
+        .tcp_keepalive(Duration::from_secs(15))
+        .build()?)
+}
+
+fn blob_is_complete(existing_size: u64, expected_size: u64) -> bool {
+    existing_size == expected_size
+}
+
+async fn fresh_download(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    size: u64,
+    progress_bar: &ProgressBar,
+) -> Result<(), PacaError> {
+    if size >= PARALLEL_THRESHOLD {
+        download_file_parallel(client, url, path, size, progress_bar).await
+    } else {
+        download_file(client, url, path, 0, progress_bar).await
+    }
+}
+
+fn verify_file_size(path: &Path, expected: u64) -> Result<(), PacaError> {
+    let actual = fs::metadata(path).map_err(PacaError::FileWrite)?.len();
+    if actual != expected {
+        return Err(PacaError::SizeMismatch { actual, expected });
+    }
+    Ok(())
+}
+
 fn pending_style() -> ProgressStyle {
     ProgressStyle::default_bar().template("{msg}").unwrap()
 }
@@ -448,6 +515,154 @@ fn download_style() -> ProgressStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn preallocated_file(path: &Path, size: u64) {
+        let file = File::create(path).unwrap();
+        file.set_len(size).unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_chunk_download_errs_when_server_returns_200_to_range_request() {
+        let server = MockServer::start().await;
+        let body = vec![7u8; 64];
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        preallocated_file(&path, 64);
+        let bar = ProgressBar::hidden();
+
+        let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &bar).await;
+
+        assert!(
+            matches!(result, Err(PacaError::RangeNotHonored(200))),
+            "expected RangeNotHonored(200), got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_chunk_download_returns_bytes_received_on_206() {
+        let server = MockServer::start().await;
+        let body = vec![3u8; 32];
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        preallocated_file(&path, 64);
+        let bar = ProgressBar::hidden();
+
+        let bytes = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &bar)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, 32);
+    }
+
+    #[tokio::test]
+    async fn is_retryable_returns_true_for_range_not_honored() {
+        assert!(is_retryable(&PacaError::RangeNotHonored(200)));
+    }
+
+    #[tokio::test]
+    async fn attempt_chunk_download_times_out_when_server_stalls() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(vec![0u8; 32])
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            build_download_client(Duration::from_secs(1), Duration::from_millis(200)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        preallocated_file(&path, 64);
+        let bar = ProgressBar::hidden();
+
+        let started = std::time::Instant::now();
+        let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &bar).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "expected error, got {:?}", result);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected read timeout to fire well under the 5s server delay, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn blob_is_complete_returns_true_for_exact_size_match() {
+        assert!(blob_is_complete(1024, 1024));
+    }
+
+    #[test]
+    fn blob_is_complete_returns_false_for_undersized_blob() {
+        assert!(!blob_is_complete(512, 1024));
+    }
+
+    #[test]
+    fn blob_is_complete_returns_false_for_oversized_blob() {
+        // Regression: previously this case was treated as "complete" because
+        // the check used `>=`. An oversized blob is evidence of a corrupted
+        // prior download and must be redownloaded, not trusted.
+        assert!(!blob_is_complete(2048, 1024));
+    }
+
+    #[test]
+    fn verify_file_size_returns_ok_when_size_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        fs::write(&path, vec![0u8; 128]).unwrap();
+
+        assert!(verify_file_size(&path, 128).is_ok());
+    }
+
+    #[test]
+    fn verify_file_size_returns_err_when_file_is_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        fs::write(&path, vec![0u8; 256]).unwrap();
+
+        let err = verify_file_size(&path, 128).unwrap_err();
+        assert!(matches!(
+            err,
+            PacaError::SizeMismatch {
+                actual: 256,
+                expected: 128
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_file_size_returns_err_when_file_is_undersized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        fs::write(&path, vec![0u8; 64]).unwrap();
+
+        let err = verify_file_size(&path, 128).unwrap_err();
+        assert!(matches!(
+            err,
+            PacaError::SizeMismatch {
+                actual: 64,
+                expected: 128
+            }
+        ));
+    }
 
     #[test]
     fn is_retryable_returns_true_for_rate_limited() {

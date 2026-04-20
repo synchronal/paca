@@ -47,9 +47,17 @@ pub enum PacaError {
     #[error("Insufficient disk space: need {needed} bytes but only {available} bytes available")]
     InsufficientDiskSpace { needed: u64, available: u64 },
 
+    /// Range request returned a non-206 status (server ignored Range header)
+    #[error("Server did not honor Range request (status {0})")]
+    RangeNotHonored(u16),
+
     /// Rate limited by the server (429), with optional Retry-After seconds
     #[error("Rate limited (retry after {0}s)")]
     RateLimited(u64),
+
+    /// Downloaded blob size does not match the expected size
+    #[error("Downloaded size mismatch: expected {expected} bytes, got {actual}")]
+    SizeMismatch { actual: u64, expected: u64 },
 
     /// Invalid path format
     #[error("Invalid path: {0}")]
