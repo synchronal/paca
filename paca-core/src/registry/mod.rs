@@ -27,7 +27,7 @@ pub fn default_headers() -> HeaderMap {
 
     if let Ok(token) = env::var("HF_TOKEN") {
         let mut auth_value: reqwest::header::HeaderValue =
-            format!("Bearer {}", token).parse().unwrap();
+            format!("Bearer {token}").parse().unwrap();
         auth_value.set_sensitive(true);
         headers.insert("Authorization", auth_value);
     }
@@ -50,7 +50,7 @@ pub async fn fetch_resolve_info(client: &Client, url: &str) -> Result<ResolveInf
     let commit_hash = headers
         .get("x-repo-commit")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| PacaError::MissingCommitHash(url.to_string()))?;
 
     let blob_hash = headers
@@ -59,7 +59,7 @@ pub async fn fetch_resolve_info(client: &Client, url: &str) -> Result<ResolveInf
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim_matches('"'))
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| PacaError::MissingBlobHash(url.to_string()))?;
 
     Ok(ResolveInfo {

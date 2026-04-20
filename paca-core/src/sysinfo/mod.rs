@@ -9,10 +9,10 @@ pub fn available_disk_space(path: &Path) -> Result<u64, std::io::Error> {
 
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+        if libc::statvfs(c_path.as_ptr(), &raw mut stat) != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+        Ok(u64::from(stat.f_bavail) * stat.f_frsize as u64)
     }
 }
 
@@ -53,7 +53,7 @@ mod tests {
             Err(crate::error::PacaError::InsufficientDiskSpace { needed, .. }) => {
                 assert_eq!(needed, u64::MAX);
             }
-            other => panic!("expected InsufficientDiskSpace, got {:?}", other),
+            other => panic!("expected InsufficientDiskSpace, got {other:?}"),
         }
     }
 }

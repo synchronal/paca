@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::cache::get_hub_dir;
+use crate::cache::HubLayout;
 use crate::error::PacaError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,29 +25,18 @@ pub struct CleanResult {
 }
 
 pub fn clean_cache(hub_dir: Option<PathBuf>) -> Result<CleanResult, PacaError> {
-    let hub_dir = match hub_dir {
-        Some(dir) => dir,
-        None => get_hub_dir()?,
-    };
-
-    if !hub_dir.exists() {
-        return Ok(CleanResult {
-            removed_files: Vec::new(),
-        });
-    }
-
+    let hub = HubLayout::open(hub_dir)?;
     let mut removed_files = Vec::new();
 
-    for entry in fs::read_dir(&hub_dir)? {
-        let entry = entry?;
-        let dir_name = entry.file_name().to_string_lossy().to_string();
+    for entry in fs::read_dir(hub.root()).map_err(PacaError::CacheDir)? {
+        let entry = entry.map_err(PacaError::CacheDir)?;
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
 
         if !dir_name.starts_with("models--") || !entry.path().is_dir() {
             continue;
         }
 
-        let model_dir = entry.path();
-        clean_model_dir(&model_dir, &mut removed_files)?;
+        clean_model_dir(&entry.path(), &mut removed_files)?;
     }
 
     removed_files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -59,45 +48,38 @@ fn clean_model_dir(
     model_dir: &Path,
     removed_files: &mut Vec<RemovedFile>,
 ) -> Result<(), PacaError> {
-    let refs_dir = model_dir.join("refs");
     let snapshots_dir = model_dir.join("snapshots");
     let blobs_dir = model_dir.join("blobs");
 
-    // Read the current commit from refs/main
-    let current_commit = refs_dir
-        .join("main")
-        .exists()
-        .then(|| fs::read_to_string(refs_dir.join("main")).ok())
-        .flatten();
+    let current_commit = fs::read_to_string(model_dir.join("refs").join("main")).ok();
 
-    // Remove snapshots not referenced by refs/main
+    // Remove snapshots not referenced by refs/main.
     if snapshots_dir.is_dir() {
-        for snapshot_entry in fs::read_dir(&snapshots_dir)? {
-            let snapshot_entry = snapshot_entry?;
-            let snapshot_name = snapshot_entry.file_name().to_string_lossy().to_string();
+        for snapshot_entry in fs::read_dir(&snapshots_dir).map_err(PacaError::CacheDir)? {
+            let snapshot_entry = snapshot_entry.map_err(PacaError::CacheDir)?;
+            let snapshot_name = snapshot_entry.file_name().to_string_lossy().into_owned();
 
             if current_commit.as_deref() != Some(&snapshot_name) {
                 remove_dir_recursive(
                     &snapshot_entry.path(),
-                    CleanReason::OrphanedSnapshot,
+                    &CleanReason::OrphanedSnapshot,
                     removed_files,
                 )?;
             }
         }
     }
 
-    // Walk remaining snapshots to collect referenced blob hashes and remove broken symlinks
+    // Walk remaining snapshots to collect referenced blob hashes and remove broken symlinks.
     let mut referenced_blobs: HashSet<String> = HashSet::new();
-
     if snapshots_dir.is_dir() {
         collect_blob_refs_recursive(&snapshots_dir, &mut referenced_blobs, removed_files)?;
     }
 
-    // Remove orphaned blobs and stray .partial files from aborted downloads
+    // Remove orphaned blobs and stray .partial files from aborted downloads.
     if blobs_dir.is_dir() {
-        for blob_entry in fs::read_dir(&blobs_dir)? {
-            let blob_entry = blob_entry?;
-            let blob_name = blob_entry.file_name().to_string_lossy().to_string();
+        for blob_entry in fs::read_dir(&blobs_dir).map_err(PacaError::CacheDir)? {
+            let blob_entry = blob_entry.map_err(PacaError::CacheDir)?;
+            let blob_name = blob_entry.file_name().to_string_lossy().into_owned();
 
             let reason = if blob_name.ends_with(".partial") {
                 Some(CleanReason::PartialBlob)
@@ -125,37 +107,47 @@ fn collect_blob_refs_recursive(
     referenced_blobs: &mut HashSet<String>,
     removed_files: &mut Vec<RemovedFile>,
 ) -> Result<(), PacaError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in fs::read_dir(dir).map_err(PacaError::CacheDir)? {
+        let entry = entry.map_err(PacaError::CacheDir)?;
         let path = entry.path();
 
         if path.is_dir() {
             collect_blob_refs_recursive(&path, referenced_blobs, removed_files)?;
-        } else if path
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            if let Ok(target) = fs::read_link(&path) {
-                let target_str = target.to_string_lossy();
-                if let Some(hash) = target_str.rsplit_once("blobs/").map(|(_, h)| h.to_string()) {
-                    // Check if the symlink target actually exists
-                    if path.exists() {
-                        referenced_blobs.insert(hash);
-                    } else {
-                        fs::remove_file(&path).map_err(PacaError::FileDelete)?;
-                        removed_files.push(RemovedFile {
-                            path,
-                            reason: CleanReason::BrokenSymlink,
-                        });
-                    }
-                }
-            } else {
-                fs::remove_file(&path).map_err(PacaError::FileDelete)?;
-                removed_files.push(RemovedFile {
-                    path,
-                    reason: CleanReason::BrokenSymlink,
-                });
-            }
+            continue;
+        }
+
+        let Ok(metadata) = path.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let Ok(target) = fs::read_link(&path) else {
+            fs::remove_file(&path).map_err(PacaError::FileDelete)?;
+            removed_files.push(RemovedFile {
+                path,
+                reason: CleanReason::BrokenSymlink,
+            });
+            continue;
+        };
+
+        let Some(hash) = target
+            .to_string_lossy()
+            .rsplit_once("blobs/")
+            .map(|(_, hash)| hash.to_string())
+        else {
+            continue;
+        };
+
+        if path.exists() {
+            referenced_blobs.insert(hash);
+        } else {
+            fs::remove_file(&path).map_err(PacaError::FileDelete)?;
+            removed_files.push(RemovedFile {
+                path,
+                reason: CleanReason::BrokenSymlink,
+            });
         }
     }
     Ok(())
@@ -163,7 +155,7 @@ fn collect_blob_refs_recursive(
 
 fn remove_dir_recursive(
     dir: &Path,
-    reason: CleanReason,
+    reason: &CleanReason,
     removed_files: &mut Vec<RemovedFile>,
 ) -> Result<(), PacaError> {
     if !dir.exists() && dir.symlink_metadata().is_err() {
@@ -171,15 +163,15 @@ fn remove_dir_recursive(
     }
 
     if dir.is_dir() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in fs::read_dir(dir).map_err(PacaError::CacheDir)? {
+            let entry = entry.map_err(PacaError::CacheDir)?;
             let path = entry.path();
             let is_symlink = path
                 .symlink_metadata()
                 .is_ok_and(|m| m.file_type().is_symlink());
 
             if path.is_dir() && !is_symlink {
-                remove_dir_recursive(&path, reason.clone(), removed_files)?;
+                remove_dir_recursive(&path, reason, removed_files)?;
             } else {
                 fs::remove_file(&path).map_err(PacaError::FileDelete)?;
                 removed_files.push(RemovedFile {
@@ -197,41 +189,7 @@ fn remove_dir_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::fs;
-    use std::os::unix::fs::symlink;
-
-    fn setup_model_dir(hub: &std::path::Path, owner: &str, model: &str) -> PathBuf {
-        let model_dir = hub.join(format!("models--{owner}--{model}"));
-        fs::create_dir_all(model_dir.join("blobs")).unwrap();
-        fs::create_dir_all(model_dir.join("refs")).unwrap();
-        fs::create_dir_all(model_dir.join("snapshots")).unwrap();
-        model_dir
-    }
-
-    fn write_blob(model_dir: &std::path::Path, hash: &str) {
-        fs::write(model_dir.join("blobs").join(hash), b"fake blob data").unwrap();
-    }
-
-    fn write_ref(model_dir: &std::path::Path, commit: &str) {
-        fs::write(model_dir.join("refs").join("main"), commit).unwrap();
-    }
-
-    fn write_snapshot_symlink(
-        model_dir: &std::path::Path,
-        commit: &str,
-        filename: &str,
-        blob_hash: &str,
-    ) {
-        let snapshot_dir = model_dir.join("snapshots").join(commit);
-        let symlink_path = snapshot_dir.join(filename);
-        if let Some(parent) = symlink_path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        let depth = filename.matches('/').count() + 2;
-        let target = format!("{}blobs/{}", "../".repeat(depth), blob_hash);
-        symlink(&target, &symlink_path).unwrap();
-    }
+    use crate::test_support::{setup_model_dir, write_blob, write_ref, write_snapshot_symlink};
 
     #[test]
     fn clean_cache_empty_dir_removes_nothing() {
@@ -292,15 +250,12 @@ mod tests {
 
         write_blob(&model_dir, "abc123");
         write_ref(&model_dir, "commit2");
-        // Current snapshot
         write_snapshot_symlink(&model_dir, "commit2", "model-Q4.gguf", "abc123");
-        // Old snapshot
         write_blob(&model_dir, "oldhash");
         write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "oldhash");
 
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
 
-        // Old snapshot's symlink should be removed
         let orphaned_snapshot_reasons: Vec<_> = result
             .removed_files
             .iter()
@@ -308,7 +263,6 @@ mod tests {
             .collect();
         assert_eq!(orphaned_snapshot_reasons.len(), 1);
 
-        // oldhash blob should be orphaned too
         let orphaned_blob_reasons: Vec<_> = result
             .removed_files
             .iter()
@@ -316,7 +270,6 @@ mod tests {
             .collect();
         assert_eq!(orphaned_blob_reasons.len(), 1);
 
-        // Current snapshot should still exist
         assert!(model_dir.join("snapshots/commit2/model-Q4.gguf").exists());
         assert!(model_dir.join("blobs/abc123").exists());
     }
@@ -326,7 +279,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
 
-        // Don't write the actual blob — symlink will be broken
         write_ref(&model_dir, "commit1");
         write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "nonexistent_hash");
 
@@ -349,7 +301,6 @@ mod tests {
         write_ref(&model_dir, "commit1");
         write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "used_hash");
 
-        // Stray .partial from an aborted download
         fs::write(
             model_dir.join("blobs").join("aborted_hash.partial"),
             b"half a download",
@@ -366,7 +317,6 @@ mod tests {
         assert_eq!(partial_reasons.len(), 1);
         assert!(partial_reasons[0].path.ends_with("aborted_hash.partial"));
 
-        // Final blob and symlink untouched
         assert!(model_dir.join("blobs/used_hash").exists());
         assert!(!model_dir.join("blobs/aborted_hash.partial").exists());
     }
@@ -381,7 +331,6 @@ mod tests {
 
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
 
-        // Should be classified as PartialBlob, not OrphanedBlob
         assert_eq!(result.removed_files.len(), 1);
         assert_eq!(result.removed_files[0].reason, CleanReason::PartialBlob);
     }
@@ -406,7 +355,6 @@ mod tests {
         assert_eq!(orphaned_reasons.len(), 1);
         assert!(orphaned_reasons[0].path.ends_with("orphaned_hash"));
 
-        // Used blob should still exist
         assert!(model_dir.join("blobs/used_hash").exists());
     }
 
@@ -414,13 +362,11 @@ mod tests {
     fn clean_cache_mixed_scenario() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Complete model — should be kept
         let good_dir = setup_model_dir(dir.path(), "owner", "good-GGUF");
         write_blob(&good_dir, "good_hash");
         write_ref(&good_dir, "commit1");
         write_snapshot_symlink(&good_dir, "commit1", "model-Q4.gguf", "good_hash");
 
-        // Model with orphaned blob — blob should be removed
         let blob_dir = setup_model_dir(dir.path(), "owner", "blob-GGUF");
         write_blob(&blob_dir, "used");
         write_blob(&blob_dir, "orphaned");
@@ -429,11 +375,9 @@ mod tests {
 
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
 
-        // Good model untouched
         assert!(good_dir.join("blobs/good_hash").exists());
         assert!(good_dir.join("snapshots/commit1/model-Q4.gguf").exists());
 
-        // Orphaned blob removed
         assert!(!blob_dir.join("blobs/orphaned").exists());
         assert!(blob_dir.join("blobs/used").exists());
 

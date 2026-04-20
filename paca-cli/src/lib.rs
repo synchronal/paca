@@ -35,8 +35,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             if models.is_empty() {
                 println!("No downloaded models found.");
             } else {
-                for model in &models {
-                    println!("{}", model.model_ref);
+                for model_ref in &models {
+                    println!("{model_ref}");
                 }
             }
         }

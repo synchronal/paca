@@ -7,3 +7,6 @@ pub mod model;
 pub mod progress;
 pub(crate) mod registry;
 pub mod sysinfo;
+
+#[cfg(test)]
+pub(crate) mod test_support;

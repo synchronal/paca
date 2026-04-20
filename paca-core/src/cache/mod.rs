@@ -1,160 +1,172 @@
 pub mod clean;
 pub mod remove;
 
-pub use crate::error::PacaError;
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use reqwest::Client;
 
+use crate::error::PacaError;
 use crate::model::ModelRef;
-use crate::registry::default_headers;
-use crate::registry::endpoint::get_model_endpoint;
+use crate::registry::endpoint::model_endpoint;
 use crate::registry::manifest::fetch_manifest;
-use crate::registry::{fetch_resolve_info, resolve_client};
-
-/// Information about a downloaded model
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct ModelInfo {
-    /// The model reference (owner/model:tag)
-    pub model_ref: ModelRef,
-    /// Whether the model is installed
-    pub installed: bool,
-}
+use crate::registry::{default_headers, fetch_resolve_info, resolve_client};
 
 /// Information about a model with an outdated commit
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct OutdatedModelInfo {
-    /// The model reference (owner/model:tag)
     pub model_ref: ModelRef,
-    /// The filename of the outdated file
     pub filename: String,
-    /// The local file path
     pub file_path: PathBuf,
 }
 
-/// Returns the HuggingFace Hub cache directory (~/.cache/huggingface/hub)
-pub(crate) fn get_hub_dir() -> Result<PathBuf, PacaError> {
-    let hub_dir = dirs::home_dir()
-        .ok_or_else(|| {
-            PacaError::CacheDir(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not determine home directory",
-            ))
-        })?
-        .join(".cache")
-        .join("huggingface")
-        .join("hub");
-
-    fs::create_dir_all(&hub_dir).map_err(PacaError::CacheDir)?;
-
-    Ok(hub_dir)
+/// The HuggingFace Hub cache root, ensured to exist on disk.
+///
+/// Constructed from an optional user override via [`HubLayout::open`]; all
+/// path derivations inside the cache go through this type rather than
+/// threading `(hub_dir, model_ref)` pairs.
+#[derive(Clone, Debug)]
+pub(crate) struct HubLayout {
+    root: PathBuf,
 }
 
-/// Returns the model directory name in HF Hub format: "models--{owner}--{model}"
+impl HubLayout {
+    /// Opens the hub directory, creating it if missing.
+    ///
+    /// `override_path` replaces the default `~/.cache/huggingface/hub`
+    /// location when set.
+    pub(crate) fn open(override_path: Option<PathBuf>) -> Result<Self, PacaError> {
+        let root = match override_path {
+            Some(root) => root,
+            None => default_hub_dir()?,
+        };
+        fs::create_dir_all(&root).map_err(PacaError::CacheDir)?;
+        Ok(Self { root })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn model<'a>(&'a self, model_ref: &'a ModelRef) -> ModelPaths<'a> {
+        ModelPaths {
+            hub: &self.root,
+            model_ref,
+        }
+    }
+}
+
+/// A view over the on-disk layout for a single model reference.
+pub(crate) struct ModelPaths<'a> {
+    hub: &'a Path,
+    model_ref: &'a ModelRef,
+}
+
+impl ModelPaths<'_> {
+    pub(crate) fn dir(&self) -> PathBuf {
+        self.hub.join(model_dir_name(self.model_ref))
+    }
+
+    pub(crate) fn blobs(&self) -> PathBuf {
+        self.dir().join("blobs")
+    }
+
+    pub(crate) fn refs(&self) -> PathBuf {
+        self.dir().join("refs")
+    }
+
+    pub(crate) fn snapshots(&self) -> PathBuf {
+        self.dir().join("snapshots")
+    }
+
+    pub(crate) fn ref_main(&self) -> PathBuf {
+        self.refs().join("main")
+    }
+
+    pub(crate) fn blob(&self, hash: &str) -> PathBuf {
+        self.blobs().join(hash)
+    }
+
+    pub(crate) fn snapshot(&self, commit_hash: &str) -> PathBuf {
+        self.snapshots().join(commit_hash)
+    }
+
+    pub(crate) fn save_ref(&self, commit_hash: &str) -> Result<(), PacaError> {
+        let dir = self.refs();
+        fs::create_dir_all(&dir).map_err(PacaError::CacheDir)?;
+        fs::write(dir.join("main"), commit_hash).map_err(PacaError::FileWrite)?;
+        Ok(())
+    }
+
+    pub(crate) fn read_ref(&self) -> Option<String> {
+        fs::read_to_string(self.ref_main()).ok()
+    }
+
+    pub(crate) fn blob_exists(&self, blob_hash: &str) -> bool {
+        self.blob(blob_hash).exists()
+    }
+}
+
+fn default_hub_dir() -> Result<PathBuf, PacaError> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        PacaError::CacheDir(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Could not determine home directory",
+        ))
+    })?;
+    Ok(home.join(".cache").join("huggingface").join("hub"))
+}
+
 pub(crate) fn model_dir_name(model_ref: &ModelRef) -> String {
     format!("models--{}--{}", model_ref.owner, model_ref.model)
 }
 
-/// Returns the blobs directory for a model
-pub(crate) fn blobs_dir(hub_dir: &Path, model_ref: &ModelRef) -> PathBuf {
-    hub_dir.join(model_dir_name(model_ref)).join("blobs")
-}
-
-/// Returns the refs directory for a model
-pub(crate) fn refs_dir(hub_dir: &Path, model_ref: &ModelRef) -> PathBuf {
-    hub_dir.join(model_dir_name(model_ref)).join("refs")
-}
-
-/// Returns the snapshots directory for a model
-pub(crate) fn snapshots_dir(hub_dir: &Path, model_ref: &ModelRef) -> PathBuf {
-    hub_dir.join(model_dir_name(model_ref)).join("snapshots")
-}
-
-/// Saves the commit hash to refs/main
-pub(crate) fn save_ref(
-    hub_dir: &Path,
-    model_ref: &ModelRef,
-    commit_hash: &str,
-) -> Result<(), PacaError> {
-    let dir = refs_dir(hub_dir, model_ref);
-    fs::create_dir_all(&dir).map_err(PacaError::CacheDir)?;
-    fs::write(dir.join("main"), commit_hash).map_err(PacaError::FileWrite)?;
-    Ok(())
-}
-
-/// Reads the commit hash from refs/main
-pub(crate) fn read_ref(hub_dir: &Path, model_ref: &ModelRef) -> Option<String> {
-    let path = refs_dir(hub_dir, model_ref).join("main");
-    fs::read_to_string(path).ok()
-}
-
-/// Checks whether a blob with the given hash exists
-pub(crate) fn blob_exists(hub_dir: &Path, model_ref: &ModelRef, blob_hash: &str) -> bool {
-    blobs_dir(hub_dir, model_ref).join(blob_hash).exists()
-}
-
-/// Lists all downloaded models from the hub directory
-pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelInfo>, PacaError> {
-    let hub_dir = match hub_dir {
-        Some(dir) => dir,
-        None => get_hub_dir()?,
-    };
-
-    if !hub_dir.exists() {
-        return Ok(Vec::new());
-    }
-
+/// Lists all downloaded models from the hub directory.
+pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelRef>, PacaError> {
+    let hub = HubLayout::open(hub_dir)?;
     let mut models = Vec::new();
 
-    for entry in fs::read_dir(&hub_dir)? {
-        let entry = entry?;
-        let dir_name = entry.file_name().to_string_lossy().to_string();
+    for entry in fs::read_dir(hub.root()).map_err(PacaError::CacheDir)? {
+        let entry = entry.map_err(PacaError::CacheDir)?;
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
 
         if !dir_name.starts_with("models--") || !entry.path().is_dir() {
             continue;
         }
 
-        list_snapshot_models(&dir_name, &entry.path(), &mut models)?;
+        collect_snapshot_models(&dir_name, &entry.path(), &mut models)?;
     }
 
-    models.sort_by_key(|a| a.model_ref.to_string());
+    models.sort_by_key(ModelRef::to_string);
 
     Ok(models)
 }
 
-fn list_snapshot_models(
+fn collect_snapshot_models(
     dir_name: &str,
     model_dir: &Path,
-    models: &mut Vec<ModelInfo>,
+    models: &mut Vec<ModelRef>,
 ) -> Result<(), PacaError> {
-    let (owner, model) = match parse_model_dir_name(dir_name) {
-        Some(pair) => pair,
-        None => return Ok(()),
+    let Some((owner, model)) = parse_model_dir_name(dir_name) else {
+        return Ok(());
     };
 
-    // Find the current snapshot via refs/main
-    let refs_main = model_dir.join("refs").join("main");
-    let commit = match fs::read_to_string(refs_main) {
-        Ok(c) => c.trim().to_string(),
-        Err(_) => return Ok(()),
+    let Ok(commit) = fs::read_to_string(model_dir.join("refs").join("main")) else {
+        return Ok(());
     };
+    let commit = commit.trim();
 
-    let snapshot_dir = model_dir.join("snapshots").join(&commit);
+    let snapshot_dir = model_dir.join("snapshots").join(commit);
     if !snapshot_dir.is_dir() {
         return Ok(());
     }
 
     for tag in collect_gguf_tags(&snapshot_dir, &model)? {
-        models.push(ModelInfo {
-            model_ref: ModelRef {
-                model: model.clone(),
-                owner: owner.clone(),
-                tag,
-            },
-            installed: true,
+        models.push(ModelRef {
+            model: model.clone(),
+            owner: owner.clone(),
+            tag,
         });
     }
 
@@ -175,40 +187,45 @@ fn collect_gguf_tags_recursive(
     model: &str,
     tags: &mut Vec<String>,
 ) -> Result<(), PacaError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in fs::read_dir(dir).map_err(PacaError::CacheDir)? {
+        let entry = entry.map_err(PacaError::CacheDir)?;
         let path = entry.path();
 
         if path.is_dir() {
             collect_gguf_tags_recursive(base, &path, model, tags)?;
-        } else {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".gguf") {
-                let relative = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
+            continue;
+        }
 
-                let tag = if let Some((subdir, _)) = relative.split_once('/') {
-                    subdir.to_string()
-                } else if let Some(derived) = derive_tag(&name, model) {
-                    derived
-                } else {
-                    continue;
-                };
+        if !is_gguf(&path) {
+            continue;
+        }
 
-                tags.push(tag);
-            }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+
+        if let Some((subdir, _)) = relative.split_once('/') {
+            tags.push(subdir.to_string());
+        } else if let Some(derived) = derive_tag(&name, model) {
+            tags.push(derived);
         }
     }
     Ok(())
 }
 
+pub(crate) fn is_gguf(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+}
+
 /// Derives a quantization tag from a GGUF filename using the model name.
 ///
-/// Strips the model base name prefix (model name without `-GGUF`), the `.gguf`
-/// suffix, and any shard suffix (e.g. `-00001-of-00002`).
+/// Strips the model base name prefix (model name without `-GGUF`), the
+/// `.gguf` suffix, and any shard suffix (e.g. `-00001-of-00002`).
 pub(crate) fn derive_tag(filename: &str, model: &str) -> Option<String> {
     let stem = filename.strip_suffix(".gguf")?;
     let model_base = model.strip_suffix("-GGUF")?;
@@ -218,67 +235,52 @@ pub(crate) fn derive_tag(filename: &str, model: &str) -> Option<String> {
         return None;
     }
 
-    // Strip shard suffix like -00001-of-00002
     let tag = if let Some((before, _)) = remainder.rsplit_once("-of-") {
-        before.rsplit_once('-').map(|(t, _)| t).unwrap_or(before)
+        before.rsplit_once('-').map_or(before, |(t, _)| t)
     } else {
         remainder
     };
 
-    if tag.is_empty() {
-        return None;
-    }
-
-    Some(tag.to_string())
+    (!tag.is_empty()).then(|| tag.to_string())
 }
 
-pub(crate) fn parse_model_dir_name(dir_name: &str) -> Option<(String, String)> {
+fn parse_model_dir_name(dir_name: &str) -> Option<(String, String)> {
     let stripped = dir_name.strip_prefix("models--")?;
     let (owner, model) = stripped.split_once("--")?;
     Some((owner.to_string(), model.to_string()))
 }
 
-/// Checks which downloaded models have outdated files by comparing commit hashes.
+/// Checks which downloaded models have outdated files by comparing commit
+/// hashes.
 ///
-/// Groups models by repo so that only one resolve-info HEAD request is made per
-/// repo, regardless of how many tags are installed.
+/// Groups models by repo so that only one resolve-info HEAD request is
+/// made per repo, regardless of how many tags are installed.
 pub async fn check_outdated_models(
     hub_dir: Option<PathBuf>,
 ) -> Result<Vec<OutdatedModelInfo>, PacaError> {
-    let hub_dir = match hub_dir {
-        Some(dir) => dir,
-        None => get_hub_dir()?,
-    };
-
-    if !hub_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let hub = HubLayout::open(hub_dir)?;
 
     let client = Client::builder()
         .default_headers(default_headers())
         .build()?;
     let head_client = resolve_client()?;
-    let endpoint = get_model_endpoint();
+    let endpoint = model_endpoint();
     let mut outdated_models = Vec::new();
 
-    let models = list_models(Some(hub_dir.clone()))?;
+    let models = list_models(Some(hub.root().to_path_buf()))?;
 
-    // Track which repos have been checked: true = outdated, false = up to date
     let mut repo_outdated: HashMap<String, bool> = HashMap::new();
 
-    for model_info in &models {
-        let model_ref = &model_info.model_ref;
+    for model_ref in &models {
         let repo = model_ref.repo();
 
-        let is_outdated = match repo_outdated.get(&repo) {
-            Some(&val) => val,
-            None => {
-                let outdated =
-                    check_repo_outdated(&client, &head_client, &endpoint, &hub_dir, model_ref)
-                        .await?;
-                repo_outdated.insert(repo, outdated);
-                outdated
-            }
+        let is_outdated = if let Some(&cached) = repo_outdated.get(&repo) {
+            cached
+        } else {
+            let outdated =
+                repo_outdated_check(&client, &head_client, endpoint, &hub, model_ref).await?;
+            repo_outdated.insert(repo, outdated);
+            outdated
         };
 
         if !is_outdated {
@@ -286,9 +288,9 @@ pub async fn check_outdated_models(
         }
 
         let manifest = fetch_manifest(&client, model_ref).await?;
-        let local_commit = read_ref(&hub_dir, model_ref);
-        let snapshot_path =
-            snapshots_dir(&hub_dir, model_ref).join(local_commit.as_deref().unwrap_or(""));
+        let paths = hub.model(model_ref);
+        let local_commit = paths.read_ref();
+        let snapshot_path = paths.snapshot(local_commit.as_deref().unwrap_or(""));
 
         for gguf_file in &manifest.gguf_files {
             outdated_models.push(OutdatedModelInfo {
@@ -304,17 +306,16 @@ pub async fn check_outdated_models(
     Ok(outdated_models)
 }
 
-async fn check_repo_outdated(
+async fn repo_outdated_check(
     client: &Client,
     head_client: &Client,
     endpoint: &str,
-    hub_dir: &Path,
+    hub: &HubLayout,
     model_ref: &ModelRef,
 ) -> Result<bool, PacaError> {
     let manifest = fetch_manifest(client, model_ref).await?;
-    let first_file = match manifest.gguf_files.first() {
-        Some(f) => f,
-        None => return Ok(false),
+    let Some(first_file) = manifest.gguf_files.first() else {
+        return Ok(false);
     };
 
     let url = format!(
@@ -324,7 +325,7 @@ async fn check_repo_outdated(
         first_file.filename
     );
 
-    let local_commit = read_ref(hub_dir, model_ref);
+    let local_commit = hub.model(model_ref).read_ref();
 
     match fetch_resolve_info(head_client, &url).await {
         Ok(info) => Ok(local_commit.as_deref() != Some(&info.commit_hash)),
@@ -336,95 +337,90 @@ async fn check_repo_outdated(
 mod tests {
     use super::*;
 
+    fn model_ref(s: &str) -> ModelRef {
+        s.parse().unwrap()
+    }
+
     #[test]
-    fn get_hub_dir_returns_huggingface_hub_subdirectory() {
-        let hub_dir = get_hub_dir().unwrap();
-        assert!(hub_dir.ends_with(".cache/huggingface/hub"));
+    fn default_hub_dir_ends_in_huggingface_hub() {
+        assert!(
+            default_hub_dir()
+                .unwrap()
+                .ends_with(".cache/huggingface/hub")
+        );
+    }
+
+    #[test]
+    fn hub_layout_creates_override_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fresh");
+        let hub = HubLayout::open(Some(root.clone())).unwrap();
+        assert!(root.is_dir());
+        assert_eq!(hub.root(), root);
     }
 
     #[test]
     fn model_dir_name_formats_correctly() {
-        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL".parse().unwrap();
         assert_eq!(
-            model_dir_name(&model_ref),
+            model_dir_name(&model_ref("unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL")),
             "models--unsloth--GLM-4.7-Flash-GGUF"
         );
     }
 
     #[test]
-    fn blobs_dir_returns_correct_path() {
-        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL".parse().unwrap();
-        let hub = PathBuf::from("/cache/huggingface/hub");
-        assert_eq!(
-            blobs_dir(&hub, &model_ref),
-            PathBuf::from("/cache/huggingface/hub/models--unsloth--GLM-4.7-Flash-GGUF/blobs")
-        );
-    }
+    fn model_paths_derive_from_hub_and_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr = model_ref("unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL");
+        let paths = hub.model(&mr);
 
-    #[test]
-    fn refs_dir_returns_correct_path() {
-        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL".parse().unwrap();
-        let hub = PathBuf::from("/cache/huggingface/hub");
-        assert_eq!(
-            refs_dir(&hub, &model_ref),
-            PathBuf::from("/cache/huggingface/hub/models--unsloth--GLM-4.7-Flash-GGUF/refs")
-        );
-    }
-
-    #[test]
-    fn snapshots_dir_returns_correct_path() {
-        let model_ref: ModelRef = "unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL".parse().unwrap();
-        let hub = PathBuf::from("/cache/huggingface/hub");
-        assert_eq!(
-            snapshots_dir(&hub, &model_ref),
-            PathBuf::from("/cache/huggingface/hub/models--unsloth--GLM-4.7-Flash-GGUF/snapshots")
-        );
+        let base = dir.path().join("models--unsloth--GLM-4.7-Flash-GGUF");
+        assert_eq!(paths.blobs(), base.join("blobs"));
+        assert_eq!(paths.refs(), base.join("refs"));
+        assert_eq!(paths.snapshots(), base.join("snapshots"));
+        assert_eq!(paths.ref_main(), base.join("refs").join("main"));
     }
 
     #[test]
     fn save_and_read_ref() {
         let dir = tempfile::tempdir().unwrap();
-        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr = model_ref("owner/model-GGUF:Q4");
 
-        save_ref(dir.path(), &model_ref, "abc123commit").unwrap();
-        assert_eq!(
-            read_ref(dir.path(), &model_ref),
-            Some("abc123commit".to_string())
-        );
+        hub.model(&mr).save_ref("abc123commit").unwrap();
+        assert_eq!(hub.model(&mr).read_ref().as_deref(), Some("abc123commit"));
     }
 
     #[test]
     fn read_ref_returns_none_when_no_ref_file() {
         let dir = tempfile::tempdir().unwrap();
-        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        assert_eq!(read_ref(dir.path(), &model_ref), None);
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(
+            hub.model(&model_ref("owner/model-GGUF:Q4")).read_ref(),
+            None
+        );
     }
 
     #[test]
     fn blob_exists_returns_true_when_blob_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        let blob_dir = blobs_dir(dir.path(), &model_ref);
-        fs::create_dir_all(&blob_dir).unwrap();
-        fs::write(blob_dir.join("abcdef1234"), b"data").unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr = model_ref("owner/model-GGUF:Q4");
+        let paths = hub.model(&mr);
+        fs::create_dir_all(paths.blobs()).unwrap();
+        fs::write(paths.blob("abcdef1234"), b"data").unwrap();
 
-        assert!(blob_exists(dir.path(), &model_ref, "abcdef1234"));
+        assert!(paths.blob_exists("abcdef1234"));
     }
 
     #[test]
     fn blob_exists_returns_false_when_blob_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-
-        assert!(!blob_exists(dir.path(), &model_ref, "abcdef1234"));
-    }
-
-    #[test]
-    fn list_models_returns_empty_for_nonexistent_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let nonexistent = dir.path().join("does-not-exist");
-        let result = list_models(Some(nonexistent)).unwrap();
-        assert!(result.is_empty());
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        assert!(
+            !hub.model(&model_ref("owner/model-GGUF:Q4"))
+                .blob_exists("abcdef1234")
+        );
     }
 
     #[test]
@@ -438,7 +434,6 @@ mod tests {
     fn list_models_skips_non_model_directories() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Not a models-- directory
         let other_dir = dir.path().join("something-else").join("paca");
         fs::create_dir_all(&other_dir).unwrap();
         fs::write(other_dir.join("Q4.json"), r#"{"test": true}"#).unwrap();
@@ -507,9 +502,9 @@ mod tests {
 
         let result = list_models(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].model_ref.owner, "owner");
-        assert_eq!(result[0].model_ref.model, "model-GGUF");
-        assert_eq!(result[0].model_ref.tag, "Q4");
+        assert_eq!(result[0].owner, "owner");
+        assert_eq!(result[0].model, "model-GGUF");
+        assert_eq!(result[0].tag, "Q4");
     }
 
     #[test]
@@ -531,8 +526,8 @@ mod tests {
 
         let result = list_models(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].model_ref.tag, "BF16");
-        assert_eq!(result[1].model_ref.tag, "Q4_K_M");
+        assert_eq!(result[0].tag, "BF16");
+        assert_eq!(result[1].tag, "Q4_K_M");
     }
 
     #[test]
@@ -551,6 +546,6 @@ mod tests {
 
         let result = list_models(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].model_ref.tag, "BF16");
+        assert_eq!(result[0].tag, "BF16");
     }
 }

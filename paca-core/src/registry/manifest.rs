@@ -3,9 +3,10 @@ use std::fmt;
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::cache::is_gguf;
 use crate::error::PacaError;
 use crate::model::ModelRef;
-use crate::registry::endpoint::get_model_endpoint;
+use crate::registry::endpoint::model_endpoint;
 
 #[derive(Debug, Deserialize)]
 struct TreeEntry {
@@ -44,10 +45,9 @@ pub struct Manifest {
 
 /// Fetches the model manifest from HuggingFace, handling both single and sharded files
 pub async fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, PacaError> {
-    let endpoint = get_model_endpoint();
+    let endpoint = model_endpoint();
     let url = format!(
-        "{}/v2/{}/manifests/{}",
-        endpoint,
+        "{endpoint}/v2/{}/manifests/{}",
         model_ref.repo(),
         model_ref.tag
     );
@@ -63,12 +63,10 @@ pub async fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Man
 
     let mut gguf_files = Vec::new();
     for file in discovered {
-        match shard_count(&file.filename) {
-            Some(_) => {
-                gguf_files
-                    .extend(fetch_tree_files(client, &endpoint, model_ref, &file.filename).await?);
-            }
-            None => gguf_files.push(file),
+        if shard_count(&file.filename).is_some() {
+            gguf_files.extend(fetch_tree_files(client, endpoint, model_ref, &file.filename).await?);
+        } else {
+            gguf_files.push(file);
         }
     }
 
@@ -91,8 +89,8 @@ fn collect_manifest_files(value: &serde_json::Value) -> Vec<GgufFile> {
         let rfilename = entry_obj
             .get("rfilename")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let size = entry_obj.get("size").and_then(|v| v.as_u64());
+            .map(std::string::ToString::to_string);
+        let size = entry_obj.get("size").and_then(serde_json::Value::as_u64);
 
         if let (Some(filename), Some(size)) = (rfilename, size) {
             files.push(GgufFile { filename, size });
@@ -110,13 +108,11 @@ async fn fetch_tree_files(
     model_ref: &ModelRef,
     rfilename: &str,
 ) -> Result<Vec<GgufFile>, PacaError> {
-    let subdir = rfilename.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let subdir = rfilename.rsplit_once('/').map_or("", |(dir, _)| dir);
 
     let url = format!(
-        "{}/api/models/{}/tree/main/{}",
-        endpoint,
-        model_ref.repo(),
-        subdir
+        "{endpoint}/api/models/{}/tree/main/{subdir}",
+        model_ref.repo()
     );
 
     let response = client.get(&url).send().await?.error_for_status()?;
@@ -125,7 +121,7 @@ async fn fetch_tree_files(
 
     let mut gguf_files: Vec<GgufFile> = entries
         .into_iter()
-        .filter(|entry| entry.path.ends_with(".gguf"))
+        .filter(|entry| is_gguf(&entry.path))
         .map(GgufFile::from)
         .collect();
 

@@ -63,24 +63,9 @@ pub enum PacaError {
     #[error("Downloaded size mismatch: expected {expected} bytes, got {actual}")]
     SizeMismatch { actual: u64, expected: u64 },
 
-    /// Invalid path format
-    #[error("Invalid path: {0}")]
-    InvalidPath(String),
-
     /// Failed to create a symlink
     #[error("Failed to create symlink: {0}")]
     Symlink(std::io::Error),
-}
-
-impl From<std::io::Error> for PacaError {
-    fn from(err: std::io::Error) -> Self {
-        match err.kind() {
-            std::io::ErrorKind::NotFound => {
-                PacaError::InvalidPath(format!("File not found: {}", err))
-            }
-            _ => PacaError::CacheDir(err),
-        }
-    }
 }
 
 /// Errors that can occur while parsing model references

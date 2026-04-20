@@ -1,5 +1,3 @@
-pub use crate::error::PacaError;
-
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -8,11 +6,12 @@ use std::time::Duration;
 
 use reqwest::Client;
 
-use crate::cache::{blob_exists, blobs_dir, get_hub_dir, save_ref, snapshots_dir};
+use crate::cache::{HubLayout, ModelPaths};
+use crate::error::PacaError;
 use crate::model::ModelRef;
 use crate::progress::FileProgress;
 use crate::registry::default_headers;
-use crate::registry::endpoint::get_model_endpoint;
+use crate::registry::endpoint::model_endpoint;
 use crate::registry::manifest::{GgufFile, fetch_manifest as fetch_registry_manifest};
 use crate::registry::{fetch_resolve_info, resolve_client};
 use crate::sysinfo::check_disk_space;
@@ -62,17 +61,11 @@ pub async fn download_model(
     );
 
     let client = build_download_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)?;
-    let hub_dir = match hub_dir {
-        Some(dir) => {
-            fs::create_dir_all(&dir).map_err(PacaError::CacheDir)?;
-            dir
-        }
-        None => get_hub_dir()?,
-    };
-    let endpoint = get_model_endpoint();
+    let hub = HubLayout::open(hub_dir)?;
+    let endpoint = model_endpoint();
     let head_client = resolve_client()?;
 
-    let blobs = blobs_dir(&hub_dir, &model_ref);
+    let blobs = hub.model(&model_ref).blobs();
     fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
 
     let total_size: u64 = files.iter().map(|f| f.size).sum();
@@ -84,55 +77,20 @@ pub async fn download_model(
     for (gguf_file, bar) in files.into_iter().zip(progress) {
         let client = client.clone();
         let head_client = head_client.clone();
-        let endpoint = endpoint.clone();
         let model_ref = model_ref.clone();
-        let hub_dir = hub_dir.clone();
-        let blobs = blobs.clone();
+        let hub = hub.clone();
 
         set.spawn(async move {
-            let url = format!(
-                "{}/{}/resolve/main/{}",
+            download_one_file(
+                &client,
+                &head_client,
                 endpoint,
-                model_ref.repo(),
-                gguf_file.filename
-            );
-
-            let resolve_info = fetch_resolve_info(&head_client, &url).await?;
-            let blob_path = blobs.join(&resolve_info.blob_hash);
-
-            if blob_exists(&hub_dir, &model_ref, &resolve_info.blob_hash) {
-                let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
-
-                if blob_is_complete(existing_size, gguf_file.size) {
-                    bar.start(gguf_file.size);
-                    bar.finish();
-
-                    let symlink_path = create_snapshot_symlink(
-                        &hub_dir,
-                        &model_ref,
-                        &resolve_info.commit_hash,
-                        &gguf_file.filename,
-                        &resolve_info.blob_hash,
-                    )?;
-                    return Ok((symlink_path, resolve_info.commit_hash));
-                }
-
-                // A final blob whose size doesn't match is evidence of a
-                // legacy (pre-atomic-rename) download or external tampering.
-                // Delete and redownload through the .partial + rename path.
-                fs::remove_file(&blob_path).map_err(PacaError::FileDelete)?;
-            }
-
-            download_to_blob(&client, &url, &blob_path, gguf_file.size, &bar).await?;
-
-            let symlink_path = create_snapshot_symlink(
-                &hub_dir,
+                &hub,
                 &model_ref,
-                &resolve_info.commit_hash,
-                &gguf_file.filename,
-                &resolve_info.blob_hash,
-            )?;
-            Ok((symlink_path, resolve_info.commit_hash))
+                gguf_file,
+                bar,
+            )
+            .await
         });
     }
 
@@ -148,32 +106,74 @@ pub async fn download_model(
     }
 
     if let Some(commit) = &commit_hash {
-        save_ref(&hub_dir, &model_ref, commit)?;
+        hub.model(&model_ref).save_ref(commit)?;
     }
 
     Ok(paths)
 }
 
-fn create_snapshot_symlink(
-    hub_dir: &Path,
+async fn download_one_file(
+    client: &Client,
+    head_client: &Client,
+    endpoint: &str,
+    hub: &HubLayout,
     model_ref: &ModelRef,
+    gguf_file: GgufFile,
+    progress: Arc<dyn FileProgress>,
+) -> Result<(PathBuf, String), PacaError> {
+    let url = format!(
+        "{endpoint}/{}/resolve/main/{}",
+        model_ref.repo(),
+        gguf_file.filename
+    );
+
+    let resolve_info = fetch_resolve_info(head_client, &url).await?;
+    let paths = hub.model(model_ref);
+    let blob_path = paths.blob(&resolve_info.blob_hash);
+
+    if paths.blob_exists(&resolve_info.blob_hash) {
+        let existing_size = fs::metadata(&blob_path).map_or(0, |m| m.len());
+
+        if blob_is_complete(existing_size, gguf_file.size) {
+            progress.start(gguf_file.size);
+            progress.finish();
+        } else {
+            // A final blob whose size doesn't match is evidence of a
+            // legacy (pre-atomic-rename) download or external tampering.
+            // Delete and redownload through the .partial + rename path.
+            fs::remove_file(&blob_path).map_err(PacaError::FileDelete)?;
+            download_to_blob(client, &url, &blob_path, gguf_file.size, &progress).await?;
+        }
+    } else {
+        download_to_blob(client, &url, &blob_path, gguf_file.size, &progress).await?;
+    }
+
+    let symlink_path = create_snapshot_symlink(
+        &paths,
+        &resolve_info.commit_hash,
+        &gguf_file.filename,
+        &resolve_info.blob_hash,
+    )?;
+    Ok((symlink_path, resolve_info.commit_hash))
+}
+
+fn create_snapshot_symlink(
+    paths: &ModelPaths<'_>,
     commit_hash: &str,
     filename: &str,
     blob_hash: &str,
 ) -> Result<PathBuf, PacaError> {
-    let snapshot_dir = snapshots_dir(hub_dir, model_ref).join(commit_hash);
-
-    let symlink_path = snapshot_dir.join(filename);
+    let symlink_path = paths.snapshot(commit_hash).join(filename);
     if let Some(parent) = symlink_path.parent() {
         fs::create_dir_all(parent).map_err(PacaError::CacheDir)?;
     }
 
-    // Calculate relative path from symlink to blob
+    // Depth: one `..` to escape the commit dir, one per subdir inside it,
+    // and one more to exit `snapshots/`.
     let depth = filename.matches('/').count() + 2;
-    let relative_blob = format!("{}blobs/{}", "../".repeat(depth), blob_hash);
+    let relative_blob = format!("{}blobs/{blob_hash}", "../".repeat(depth));
 
-    // Remove existing symlink if present
-    if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+    if symlink_path.symlink_metadata().is_ok() {
         fs::remove_file(&symlink_path).map_err(PacaError::FileDelete)?;
     }
 
@@ -198,7 +198,7 @@ async fn download_file(
         match attempt_download(client, url, path, bytes_on_disk, progress).await {
             Ok(()) => return Ok(()),
             Err(e) if is_retryable(&e) => {
-                let new_size = fs::metadata(path).map(|m| m.len()).unwrap_or(bytes_on_disk);
+                let new_size = fs::metadata(path).map_or(bytes_on_disk, |m| m.len());
 
                 if new_size > bytes_on_disk {
                     retries = 0;
@@ -211,14 +211,12 @@ async fn download_file(
                     return Err(e);
                 }
 
-                let delay_secs = match &e {
-                    PacaError::RateLimited(wait) if *wait > 0 => *wait,
-                    _ => 1u64 << retries,
-                };
+                let delay = retry_delay(&e, retries);
                 progress.println(&format!(
-                    "Download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
+                    "Download error: {e}. Retrying in {}s (attempt {retries}/{MAX_RETRIES})...",
+                    delay.as_secs()
                 ));
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                tokio::time::sleep(delay).await;
             }
             Err(e) => return Err(e),
         }
@@ -227,17 +225,16 @@ async fn download_file(
 
 fn is_retryable(error: &PacaError) -> bool {
     match error {
-        PacaError::Download(_) => true,
-        PacaError::ManifestFetch(e) => {
-            if let Some(status) = e.status() {
-                status.is_server_error()
-            } else {
-                true
-            }
-        }
-        PacaError::RangeNotHonored(_) => true,
-        PacaError::RateLimited(_) => true,
+        PacaError::Download(_) | PacaError::RangeNotHonored(_) | PacaError::RateLimited(_) => true,
+        PacaError::ManifestFetch(e) => e.status().is_none_or(|status| status.is_server_error()),
         _ => false,
+    }
+}
+
+fn retry_delay(error: &PacaError, attempt: u32) -> Duration {
+    match error {
+        PacaError::RateLimited(wait) if *wait > 0 => Duration::from_secs(*wait),
+        _ => Duration::from_secs(1u64 << attempt.min(30)),
     }
 }
 
@@ -251,19 +248,13 @@ async fn attempt_download(
     let mut request = client.get(url);
 
     if resume_from > 0 {
-        request = request.header("Range", format!("bytes={}-", resume_from));
+        request = request.header("Range", format!("bytes={resume_from}-"));
     }
 
     let response = request.send().await?;
 
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        return Err(PacaError::RateLimited(retry_after));
+        return Err(PacaError::RateLimited(parse_retry_after(&response)));
     }
 
     let mut response = response.error_for_status()?;
@@ -298,6 +289,15 @@ async fn attempt_download(
     progress.finish();
 
     Ok(())
+}
+
+fn parse_retry_after(response: &reqwest::Response) -> u64 {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Minimum file size to use parallel chunk downloads (100 MB)
@@ -362,7 +362,7 @@ async fn download_chunk(
                 }
 
                 // Server closed early without delivering the full range.
-                // Treat making any progress as a reset for the retry counter.
+                // Treat any progress as a reset for the retry counter.
                 if received > 0 {
                     retries = 0;
                 } else {
@@ -375,11 +375,12 @@ async fn download_chunk(
                     )));
                 }
 
-                let delay_secs = 1u64 << retries;
+                let delay = Duration::from_secs(1u64 << retries.min(30));
                 progress.println(&format!(
-                    "Chunk ended early ({bytes_written}/{chunk_size} bytes). Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
+                    "Chunk ended early ({bytes_written}/{chunk_size} bytes). Retrying in {}s (attempt {retries}/{MAX_RETRIES})...",
+                    delay.as_secs()
                 ));
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                tokio::time::sleep(delay).await;
             }
             Err(e) if is_retryable(&e) => {
                 retries += 1;
@@ -387,14 +388,12 @@ async fn download_chunk(
                     return Err(e);
                 }
 
-                let delay_secs = match &e {
-                    PacaError::RateLimited(wait) if *wait > 0 => *wait,
-                    _ => 1u64 << retries,
-                };
+                let delay = retry_delay(&e, retries);
                 progress.println(&format!(
-                    "Chunk download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
+                    "Chunk download error: {e}. Retrying in {}s (attempt {retries}/{MAX_RETRIES})...",
+                    delay.as_secs()
                 ));
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                tokio::time::sleep(delay).await;
             }
             Err(e) => return Err(e),
         }
@@ -411,18 +410,12 @@ async fn attempt_chunk_download(
 ) -> Result<u64, PacaError> {
     let response = client
         .get(url)
-        .header("Range", format!("bytes={}-{}", start, end))
+        .header("Range", format!("bytes={start}-{end}"))
         .send()
         .await?;
 
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        return Err(PacaError::RateLimited(retry_after));
+        return Err(PacaError::RateLimited(parse_retry_after(&response)));
     }
 
     let response = response.error_for_status()?;
@@ -511,7 +504,7 @@ async fn download_to_blob(
 ) -> Result<(), PacaError> {
     let partial = partial_path(final_path);
 
-    let existing = fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+    let existing = fs::metadata(&partial).map_or(0, |m| m.len());
     let resume_from = if existing > total_size {
         fs::remove_file(&partial).map_err(PacaError::FileDelete)?;
         0
@@ -581,8 +574,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(PacaError::RangeNotHonored(200))),
-            "expected RangeNotHonored(200), got {:?}",
-            result
+            "expected RangeNotHonored(200), got {result:?}"
         );
     }
 
@@ -675,7 +667,6 @@ mod tests {
         let client = Client::new();
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join("abc123");
-        // Simulate a corrupt prior run: oversized partial on disk.
         fs::write(partial_path(&final_path), vec![0u8; 9999]).unwrap();
         let progress = noop_progress();
 
@@ -716,11 +707,10 @@ mod tests {
         let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &progress).await;
         let elapsed = started.elapsed();
 
-        assert!(result.is_err(), "expected error, got {:?}", result);
+        assert!(result.is_err(), "expected error, got {result:?}");
         assert!(
             elapsed < Duration::from_secs(2),
-            "expected read timeout to fire well under the 5s server delay, took {:?}",
-            elapsed
+            "expected read timeout to fire well under the 5s server delay, took {elapsed:?}"
         );
     }
 
@@ -837,19 +827,14 @@ mod tests {
     #[test]
     fn create_snapshot_symlink_creates_symlink_for_root_file() {
         let dir = tempfile::tempdir().unwrap();
-        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        let blob_dir = blobs_dir(dir.path(), &model_ref);
-        fs::create_dir_all(&blob_dir).unwrap();
-        fs::write(blob_dir.join("abc123hash"), b"fake data").unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        let paths = hub.model(&mr);
+        fs::create_dir_all(paths.blobs()).unwrap();
+        fs::write(paths.blob("abc123hash"), b"fake data").unwrap();
 
-        let result = create_snapshot_symlink(
-            dir.path(),
-            &model_ref,
-            "commitabc",
-            "model-Q4.gguf",
-            "abc123hash",
-        )
-        .unwrap();
+        let result =
+            create_snapshot_symlink(&paths, "commitabc", "model-Q4.gguf", "abc123hash").unwrap();
 
         assert!(result.symlink_metadata().unwrap().file_type().is_symlink());
         let target = fs::read_link(&result).unwrap();
@@ -859,14 +844,14 @@ mod tests {
     #[test]
     fn create_snapshot_symlink_creates_symlink_for_subdir_file() {
         let dir = tempfile::tempdir().unwrap();
-        let model_ref: ModelRef = "owner/model-GGUF:BF16".parse().unwrap();
-        let blob_dir = blobs_dir(dir.path(), &model_ref);
-        fs::create_dir_all(&blob_dir).unwrap();
-        fs::write(blob_dir.join("def456hash"), b"fake data").unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr: ModelRef = "owner/model-GGUF:BF16".parse().unwrap();
+        let paths = hub.model(&mr);
+        fs::create_dir_all(paths.blobs()).unwrap();
+        fs::write(paths.blob("def456hash"), b"fake data").unwrap();
 
         let result = create_snapshot_symlink(
-            dir.path(),
-            &model_ref,
+            &paths,
             "commitdef",
             "BF16/model-BF16-00001-of-00002.gguf",
             "def456hash",
@@ -881,17 +866,16 @@ mod tests {
     #[test]
     fn create_snapshot_symlink_replaces_existing_symlink() {
         let dir = tempfile::tempdir().unwrap();
-        let model_ref: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        let blob_dir = blobs_dir(dir.path(), &model_ref);
-        fs::create_dir_all(&blob_dir).unwrap();
-        fs::write(blob_dir.join("hash1"), b"data1").unwrap();
-        fs::write(blob_dir.join("hash2"), b"data2").unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        let paths = hub.model(&mr);
+        fs::create_dir_all(paths.blobs()).unwrap();
+        fs::write(paths.blob("hash1"), b"data1").unwrap();
+        fs::write(paths.blob("hash2"), b"data2").unwrap();
 
-        create_snapshot_symlink(dir.path(), &model_ref, "commit1", "model.gguf", "hash1").unwrap();
+        create_snapshot_symlink(&paths, "commit1", "model.gguf", "hash1").unwrap();
 
-        let result =
-            create_snapshot_symlink(dir.path(), &model_ref, "commit1", "model.gguf", "hash2")
-                .unwrap();
+        let result = create_snapshot_symlink(&paths, "commit1", "model.gguf", "hash2").unwrap();
 
         let target = fs::read_link(&result).unwrap();
         assert_eq!(target.to_str().unwrap(), "../../blobs/hash2");
