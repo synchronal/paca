@@ -3,28 +3,65 @@ pub use crate::error::PacaError;
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 
 use crate::cache::{blob_exists, blobs_dir, get_hub_dir, save_ref, snapshots_dir};
 use crate::model::ModelRef;
+use crate::progress::FileProgress;
 use crate::registry::default_headers;
 use crate::registry::endpoint::get_model_endpoint;
-use crate::registry::manifest::fetch_manifest;
+use crate::registry::manifest::{GgufFile, fetch_manifest as fetch_registry_manifest};
 use crate::registry::{fetch_resolve_info, resolve_client};
 use crate::sysinfo::check_disk_space;
 
-/// Downloads a GGUF model from HuggingFace into the HF Hub cache format
-pub async fn download_model(
-    model: &str,
-    hub_dir: Option<PathBuf>,
-) -> Result<Vec<PathBuf>, PacaError> {
+/// A prepared download manifest: the parsed model ref plus the GGUF
+/// files that will be fetched. Returned by [`fetch_manifest`] so callers
+/// can create one progress reporter per file before invoking
+/// [`download_model`].
+pub struct ModelManifest {
+    model_ref: ModelRef,
+    files: Vec<GgufFile>,
+}
+
+impl ModelManifest {
+    /// Iterator over `(filename, size_in_bytes)` tuples for every GGUF
+    /// file that will be downloaded.
+    pub fn files(&self) -> impl ExactSizeIterator<Item = (&str, u64)> + '_ {
+        self.files.iter().map(|f| (f.filename.as_str(), f.size))
+    }
+}
+
+/// Fetches the model manifest from HuggingFace without starting the download.
+pub async fn fetch_manifest(model: &str) -> Result<ModelManifest, PacaError> {
     let model_ref: ModelRef = model.parse()?;
     let client = build_download_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)?;
+    let manifest = fetch_registry_manifest(&client, &model_ref).await?;
+    Ok(ModelManifest {
+        files: manifest.gguf_files,
+        model_ref,
+    })
+}
 
-    let manifest = fetch_manifest(&client, &model_ref).await?;
+/// Downloads a GGUF model from HuggingFace into the HF Hub cache format.
+///
+/// `progress` must contain one reporter per file in `manifest`, in the
+/// same order as [`ModelManifest::files`].
+pub async fn download_model(
+    manifest: ModelManifest,
+    hub_dir: Option<PathBuf>,
+    progress: Vec<Arc<dyn FileProgress>>,
+) -> Result<Vec<PathBuf>, PacaError> {
+    let ModelManifest { files, model_ref } = manifest;
+    assert_eq!(
+        files.len(),
+        progress.len(),
+        "progress reporter count must match manifest file count"
+    );
+
+    let client = build_download_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)?;
     let hub_dir = match hub_dir {
         Some(dir) => {
             fs::create_dir_all(&dir).map_err(PacaError::CacheDir)?;
@@ -38,25 +75,13 @@ pub async fn download_model(
     let blobs = blobs_dir(&hub_dir, &model_ref);
     fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
 
-    let total_size: u64 = manifest.gguf_files.iter().map(|f| f.size).sum();
+    let total_size: u64 = files.iter().map(|f| f.size).sum();
     check_disk_space(&blobs, total_size)?;
-
-    let multi = MultiProgress::new();
-    let bars: Vec<ProgressBar> = manifest
-        .gguf_files
-        .iter()
-        .map(|gguf_file| {
-            let bar = multi.add(ProgressBar::new(gguf_file.size));
-            bar.set_style(pending_style());
-            bar.set_message(gguf_file.filename.clone());
-            bar
-        })
-        .collect();
 
     let mut set: tokio::task::JoinSet<Result<(PathBuf, String), PacaError>> =
         tokio::task::JoinSet::new();
 
-    for (gguf_file, bar) in manifest.gguf_files.into_iter().zip(bars) {
+    for (gguf_file, bar) in files.into_iter().zip(progress) {
         let client = client.clone();
         let head_client = head_client.clone();
         let endpoint = endpoint.clone();
@@ -79,8 +104,7 @@ pub async fn download_model(
                 let existing_size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
 
                 if blob_is_complete(existing_size, gguf_file.size) {
-                    bar.set_style(download_style());
-                    bar.set_position(gguf_file.size);
+                    bar.start(gguf_file.size);
                     bar.finish();
 
                     let symlink_path = create_snapshot_symlink(
@@ -165,13 +189,13 @@ async fn download_file(
     url: &str,
     path: &Path,
     resume_from: u64,
-    progress_bar: &ProgressBar,
+    progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
     let mut retries: u32 = 0;
     let mut bytes_on_disk = resume_from;
 
     loop {
-        match attempt_download(client, url, path, bytes_on_disk, progress_bar).await {
+        match attempt_download(client, url, path, bytes_on_disk, progress).await {
             Ok(()) => return Ok(()),
             Err(e) if is_retryable(&e) => {
                 let new_size = fs::metadata(path).map(|m| m.len()).unwrap_or(bytes_on_disk);
@@ -191,7 +215,7 @@ async fn download_file(
                     PacaError::RateLimited(wait) if *wait > 0 => *wait,
                     _ => 1u64 << retries,
                 };
-                progress_bar.println(format!(
+                progress.println(&format!(
                     "Download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
                 ));
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -222,7 +246,7 @@ async fn attempt_download(
     url: &str,
     path: &Path,
     resume_from: u64,
-    progress_bar: &ProgressBar,
+    progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
     let mut request = client.get(url);
 
@@ -259,8 +283,7 @@ async fn attempt_download(
         )
     };
 
-    progress_bar.set_style(download_style());
-    progress_bar.set_position(start_pos);
+    progress.start(start_pos);
 
     while let Some(chunk) = response
         .chunk()
@@ -268,11 +291,11 @@ async fn attempt_download(
         .map_err(|e| PacaError::Download(std::io::Error::other(e)))?
     {
         file.write_all(&chunk).map_err(PacaError::FileWrite)?;
-        progress_bar.inc(chunk.len() as u64);
+        progress.inc(chunk.len() as u64);
     }
 
     file.flush().map_err(PacaError::FileWrite)?;
-    progress_bar.finish();
+    progress.finish();
 
     Ok(())
 }
@@ -288,7 +311,7 @@ async fn download_file_parallel(
     url: &str,
     path: &Path,
     total_size: u64,
-    progress_bar: &ProgressBar,
+    progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
     let chunks = calculate_chunks(total_size, CHUNK_COUNT);
 
@@ -296,8 +319,7 @@ async fn download_file_parallel(
     file.set_len(total_size).map_err(PacaError::FileWrite)?;
     drop(file);
 
-    progress_bar.set_style(download_style());
-    progress_bar.set_position(0);
+    progress.start(0);
 
     let mut set = tokio::task::JoinSet::new();
 
@@ -305,7 +327,7 @@ async fn download_file_parallel(
         let client = client.clone();
         let url = url.to_string();
         let path = path.to_path_buf();
-        let bar = progress_bar.clone();
+        let bar = Arc::clone(progress);
 
         set.spawn(async move { download_chunk(&client, &url, &path, start, end, &bar).await });
     }
@@ -314,7 +336,7 @@ async fn download_file_parallel(
         result.expect("chunk download task panicked")?;
     }
 
-    progress_bar.finish();
+    progress.finish();
     Ok(())
 }
 
@@ -324,7 +346,7 @@ async fn download_chunk(
     path: &Path,
     start: u64,
     end: u64,
-    progress_bar: &ProgressBar,
+    progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
     let mut retries: u32 = 0;
     let mut bytes_written: u64 = 0;
@@ -332,7 +354,7 @@ async fn download_chunk(
 
     loop {
         let current_start = start + bytes_written;
-        match attempt_chunk_download(client, url, path, current_start, end, progress_bar).await {
+        match attempt_chunk_download(client, url, path, current_start, end, progress).await {
             Ok(received) => {
                 bytes_written += received;
                 if bytes_written >= chunk_size {
@@ -354,7 +376,7 @@ async fn download_chunk(
                 }
 
                 let delay_secs = 1u64 << retries;
-                progress_bar.println(format!(
+                progress.println(&format!(
                     "Chunk ended early ({bytes_written}/{chunk_size} bytes). Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
                 ));
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -369,7 +391,7 @@ async fn download_chunk(
                     PacaError::RateLimited(wait) if *wait > 0 => *wait,
                     _ => 1u64 << retries,
                 };
-                progress_bar.println(format!(
+                progress.println(&format!(
                     "Chunk download error: {e}. Retrying in {delay_secs}s (attempt {retries}/{MAX_RETRIES})..."
                 ));
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -385,7 +407,7 @@ async fn attempt_chunk_download(
     path: &Path,
     start: u64,
     end: u64,
-    progress_bar: &ProgressBar,
+    progress: &Arc<dyn FileProgress>,
 ) -> Result<u64, PacaError> {
     let response = client
         .get(url)
@@ -425,7 +447,7 @@ async fn attempt_chunk_download(
         .map_err(|e| PacaError::Download(std::io::Error::other(e)))?
     {
         file.write_all(&chunk).map_err(PacaError::FileWrite)?;
-        progress_bar.inc(chunk.len() as u64);
+        progress.inc(chunk.len() as u64);
         bytes_received += chunk.len() as u64;
     }
 
@@ -485,7 +507,7 @@ async fn download_to_blob(
     url: &str,
     final_path: &Path,
     total_size: u64,
-    progress_bar: &ProgressBar,
+    progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
     let partial = partial_path(final_path);
 
@@ -498,9 +520,9 @@ async fn download_to_blob(
     };
 
     if resume_from == 0 && total_size >= PARALLEL_THRESHOLD {
-        download_file_parallel(client, url, &partial, total_size, progress_bar).await?;
+        download_file_parallel(client, url, &partial, total_size, progress).await?;
     } else {
-        download_file(client, url, &partial, resume_from, progress_bar).await?;
+        download_file(client, url, &partial, resume_from, progress).await?;
     }
 
     verify_file_size(&partial, total_size)?;
@@ -516,22 +538,24 @@ fn verify_file_size(path: &Path, expected: u64) -> Result<(), PacaError> {
     Ok(())
 }
 
-fn pending_style() -> ProgressStyle {
-    ProgressStyle::default_bar().template("{msg}").unwrap()
-}
-
-fn download_style() -> ProgressStyle {
-    ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
-        .unwrap()
-        .progress_chars("#>-")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct NoopProgress;
+
+    impl FileProgress for NoopProgress {
+        fn start(&self, _: u64) {}
+        fn inc(&self, _: u64) {}
+        fn println(&self, _: &str) {}
+        fn finish(&self) {}
+    }
+
+    fn noop_progress() -> Arc<dyn FileProgress> {
+        Arc::new(NoopProgress)
+    }
 
     fn preallocated_file(path: &Path, size: u64) {
         let file = File::create(path).unwrap();
@@ -551,9 +575,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob");
         preallocated_file(&path, 64);
-        let bar = ProgressBar::hidden();
+        let progress = noop_progress();
 
-        let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &bar).await;
+        let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &progress).await;
 
         assert!(
             matches!(result, Err(PacaError::RangeNotHonored(200))),
@@ -575,9 +599,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob");
         preallocated_file(&path, 64);
-        let bar = ProgressBar::hidden();
+        let progress = noop_progress();
 
-        let bytes = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &bar)
+        let bytes = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &progress)
             .await
             .unwrap();
 
@@ -619,11 +643,17 @@ mod tests {
         let client = Client::new();
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join("abc123");
-        let bar = ProgressBar::hidden();
+        let progress = noop_progress();
 
-        download_to_blob(&client, &server.uri(), &final_path, body.len() as u64, &bar)
-            .await
-            .unwrap();
+        download_to_blob(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await
+        .unwrap();
 
         assert!(final_path.exists(), "final blob should exist");
         assert!(
@@ -647,11 +677,17 @@ mod tests {
         let final_path = dir.path().join("abc123");
         // Simulate a corrupt prior run: oversized partial on disk.
         fs::write(partial_path(&final_path), vec![0u8; 9999]).unwrap();
-        let bar = ProgressBar::hidden();
+        let progress = noop_progress();
 
-        download_to_blob(&client, &server.uri(), &final_path, body.len() as u64, &bar)
-            .await
-            .unwrap();
+        download_to_blob(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(fs::read(&final_path).unwrap(), body);
         assert!(!partial_path(&final_path).exists());
@@ -674,10 +710,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob");
         preallocated_file(&path, 64);
-        let bar = ProgressBar::hidden();
+        let progress = noop_progress();
 
         let started = std::time::Instant::now();
-        let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &bar).await;
+        let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &progress).await;
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "expected error, got {:?}", result);
@@ -793,8 +829,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_model_returns_error_for_missing_tag() {
-        let result = download_model("owner/model", None).await;
+    async fn fetch_manifest_returns_error_for_missing_tag() {
+        let result = fetch_manifest("owner/model").await;
         assert!(result.is_err());
     }
 

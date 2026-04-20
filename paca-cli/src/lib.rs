@@ -1,6 +1,8 @@
 #![cfg_attr(feature = "strict", deny(warnings))]
 
 pub mod cli;
+pub mod progress;
+
 use cli::Cli;
 
 /// Executes the command-line interface logic
@@ -17,7 +19,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Download(args) => {
-            let paths = paca_core::download::download_model(&args.model, args.hub_dir).await?;
+            let manifest = paca_core::download::fetch_manifest(&args.model).await?;
+            let (_multi, reporters) = progress::build_progress(manifest.files());
+            let paths =
+                paca_core::download::download_model(manifest, args.hub_dir, reporters).await?;
             for path in &paths {
                 println!("{}", path.display());
             }
