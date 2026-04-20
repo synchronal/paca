@@ -10,6 +10,7 @@ pub enum CleanReason {
     BrokenSymlink,
     OrphanedBlob,
     OrphanedSnapshot,
+    PartialBlob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,17 +93,25 @@ fn clean_model_dir(
         collect_blob_refs_recursive(&snapshots_dir, &mut referenced_blobs, removed_files)?;
     }
 
-    // Remove orphaned blobs
+    // Remove orphaned blobs and stray .partial files from aborted downloads
     if blobs_dir.is_dir() {
         for blob_entry in fs::read_dir(&blobs_dir)? {
             let blob_entry = blob_entry?;
             let blob_name = blob_entry.file_name().to_string_lossy().to_string();
 
-            if !referenced_blobs.contains(&blob_name) {
+            let reason = if blob_name.ends_with(".partial") {
+                Some(CleanReason::PartialBlob)
+            } else if !referenced_blobs.contains(&blob_name) {
+                Some(CleanReason::OrphanedBlob)
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
                 fs::remove_file(blob_entry.path()).map_err(PacaError::FileDelete)?;
                 removed_files.push(RemovedFile {
                     path: blob_entry.path(),
-                    reason: CleanReason::OrphanedBlob,
+                    reason,
                 });
             }
         }
@@ -329,6 +338,52 @@ mod tests {
             .filter(|r| r.reason == CleanReason::BrokenSymlink)
             .collect();
         assert_eq!(broken_reasons.len(), 1);
+    }
+
+    #[test]
+    fn clean_cache_removes_partial_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+
+        write_blob(&model_dir, "used_hash");
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "used_hash");
+
+        // Stray .partial from an aborted download
+        fs::write(
+            model_dir.join("blobs").join("aborted_hash.partial"),
+            b"half a download",
+        )
+        .unwrap();
+
+        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
+
+        let partial_reasons: Vec<_> = result
+            .removed_files
+            .iter()
+            .filter(|r| r.reason == CleanReason::PartialBlob)
+            .collect();
+        assert_eq!(partial_reasons.len(), 1);
+        assert!(partial_reasons[0].path.ends_with("aborted_hash.partial"));
+
+        // Final blob and symlink untouched
+        assert!(model_dir.join("blobs/used_hash").exists());
+        assert!(!model_dir.join("blobs/aborted_hash.partial").exists());
+    }
+
+    #[test]
+    fn clean_cache_does_not_treat_partial_as_orphaned_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+
+        write_ref(&model_dir, "commit1");
+        fs::write(model_dir.join("blobs").join("abc.partial"), b"x").unwrap();
+
+        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
+
+        // Should be classified as PartialBlob, not OrphanedBlob
+        assert_eq!(result.removed_files.len(), 1);
+        assert_eq!(result.removed_files[0].reason, CleanReason::PartialBlob);
     }
 
     #[test]

@@ -93,21 +93,13 @@ pub async fn download_model(
                     return Ok((symlink_path, resolve_info.commit_hash));
                 }
 
-                if existing_size > gguf_file.size {
-                    // Oversized blob on disk — evidence of a corrupt prior run
-                    // (e.g. a parallel chunk that wrote past its range). Delete
-                    // and start fresh rather than trusting it.
-                    fs::remove_file(&blob_path).map_err(PacaError::FileDelete)?;
-                    fresh_download(&client, &url, &blob_path, gguf_file.size, &bar).await?;
-                } else {
-                    // Partial blob exists — resume with single connection
-                    download_file(&client, &url, &blob_path, existing_size, &bar).await?;
-                }
-            } else {
-                fresh_download(&client, &url, &blob_path, gguf_file.size, &bar).await?;
+                // A final blob whose size doesn't match is evidence of a
+                // legacy (pre-atomic-rename) download or external tampering.
+                // Delete and redownload through the .partial + rename path.
+                fs::remove_file(&blob_path).map_err(PacaError::FileDelete)?;
             }
 
-            verify_file_size(&blob_path, gguf_file.size)?;
+            download_to_blob(&client, &url, &blob_path, gguf_file.size, &bar).await?;
 
             let symlink_path = create_snapshot_symlink(
                 &hub_dir,
@@ -479,18 +471,41 @@ fn blob_is_complete(existing_size: u64, expected_size: u64) -> bool {
     existing_size == expected_size
 }
 
-async fn fresh_download(
+fn partial_path(final_path: &Path) -> PathBuf {
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    final_path.with_file_name(name)
+}
+
+/// Downloads `total_size` bytes from `url` into `<final_path>.partial`, then
+/// atomically renames to `final_path` on success. An interrupted run leaves
+/// only a `.partial` file — never a misleadingly-sized final blob.
+async fn download_to_blob(
     client: &Client,
     url: &str,
-    path: &Path,
-    size: u64,
+    final_path: &Path,
+    total_size: u64,
     progress_bar: &ProgressBar,
 ) -> Result<(), PacaError> {
-    if size >= PARALLEL_THRESHOLD {
-        download_file_parallel(client, url, path, size, progress_bar).await
+    let partial = partial_path(final_path);
+
+    let existing = fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+    let resume_from = if existing > total_size {
+        fs::remove_file(&partial).map_err(PacaError::FileDelete)?;
+        0
     } else {
-        download_file(client, url, path, 0, progress_bar).await
+        existing
+    };
+
+    if resume_from == 0 && total_size >= PARALLEL_THRESHOLD {
+        download_file_parallel(client, url, &partial, total_size, progress_bar).await?;
+    } else {
+        download_file(client, url, &partial, resume_from, progress_bar).await?;
     }
+
+    verify_file_size(&partial, total_size)?;
+    fs::rename(&partial, final_path).map_err(PacaError::FileWrite)?;
+    Ok(())
 }
 
 fn verify_file_size(path: &Path, expected: u64) -> Result<(), PacaError> {
@@ -572,6 +587,74 @@ mod tests {
     #[tokio::test]
     async fn is_retryable_returns_true_for_range_not_honored() {
         assert!(is_retryable(&PacaError::RangeNotHonored(200)));
+    }
+
+    #[test]
+    fn partial_path_appends_partial_suffix() {
+        let blob = PathBuf::from("/tmp/blobs/abc123");
+        assert_eq!(
+            partial_path(&blob),
+            PathBuf::from("/tmp/blobs/abc123.partial")
+        );
+    }
+
+    #[test]
+    fn partial_path_preserves_hash_with_dots() {
+        let blob = PathBuf::from("/tmp/blobs/abc.def");
+        assert_eq!(
+            partial_path(&blob),
+            PathBuf::from("/tmp/blobs/abc.def.partial")
+        );
+    }
+
+    #[tokio::test]
+    async fn download_to_blob_writes_final_file_and_removes_partial() {
+        let server = MockServer::start().await;
+        let body = b"hello world".to_vec();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        let bar = ProgressBar::hidden();
+
+        download_to_blob(&client, &server.uri(), &final_path, body.len() as u64, &bar)
+            .await
+            .unwrap();
+
+        assert!(final_path.exists(), "final blob should exist");
+        assert!(
+            !partial_path(&final_path).exists(),
+            "partial file should have been renamed away"
+        );
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn download_to_blob_cleans_up_oversized_partial_before_downloading() {
+        let server = MockServer::start().await;
+        let body = b"small body".to_vec();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        // Simulate a corrupt prior run: oversized partial on disk.
+        fs::write(partial_path(&final_path), vec![0u8; 9999]).unwrap();
+        let bar = ProgressBar::hidden();
+
+        download_to_blob(&client, &server.uri(), &final_path, body.len() as u64, &bar)
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+        assert!(!partial_path(&final_path).exists());
     }
 
     #[tokio::test]
