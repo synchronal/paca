@@ -1085,7 +1085,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "paca"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "libc",
@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "paca-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
