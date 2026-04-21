@@ -25,5 +25,10 @@ tempfile.workspace = true
 wiremock.workspace = true
 
 [features]
+default = ["rustls"]
+native-tls = ["reqwest/native-tls"]
+native-tls-vendored = ["reqwest/native-tls-vendored"]
+rustls = ["reqwest/rustls"]
+rustls-no-provider = ["reqwest/rustls-no-provider"]
 strict = [] # Treat warnings as a build error.
 
