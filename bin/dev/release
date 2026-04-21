@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+trap "exit" INT
+
+source "$(brew --prefix)/share/medic-bash/cecho.bash"
+
+set -e
+
+mkdir -p tmp/release
+rm -f tmp/release/*
+
+medic run --name "Build: Darwin aarch64" \
+  --cmd "cargo build --target aarch64-apple-darwin -r --color always" \
+  --verbose
+
+medic run --name "Build: Darwin x86_64" \
+  --cmd "cargo build --target x86_64-apple-darwin -r --color always" \
+  --verbose
+
+medic run --name "Package: Darwin aarch64" \
+  --cmd "(cd target/aarch64-apple-darwin/release && tar -czf ../../../tmp/release/paca-darwin-arm64.tar.gz paca)"
+
+medic run --name "Package: Darwin x86_64" \
+  --cmd "(cd target/x86_64-apple-darwin/release && tar -czf ../../../tmp/release/paca-darwin-x86_64.tar.gz paca)"
+
+medic run --name "shasum: Darwin aarch64" \
+  --cmd "(cd tmp/release && sha256sum paca-darwin-arm64.tar.gz > paca-darwin-arm64.sha256sum)"
+
+medic run --name "shasum: Darwin x86_64" \
+  --cmd "(cd tmp/release && sha256sum paca-darwin-x86_64.tar.gz > paca-darwin-x86_64.sha256sum)"
+
+cecho --bright-green "\nChecksums:"
+cat tmp/release/*.sha256sum
