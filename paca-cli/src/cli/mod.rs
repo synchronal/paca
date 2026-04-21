@@ -17,11 +17,13 @@ pub enum Commands {
     /// Remove stale files from the cache
     Clean(CommonArgs),
     /// Download a model from HuggingFace
+    #[command(aliases = ["dl"])]
     Download(ModelArgs),
     /// List all downloaded models
     #[command(aliases = ["ls"])]
     List(CommonArgs),
     /// Check which downloaded models have outdated files
+    #[command(aliases = ["o"])]
     Outdated(CommonArgs),
     /// Remove a downloaded model or tag
     #[command(aliases = ["rm"])]
