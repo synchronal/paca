@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use paca_core::progress::FileProgress;
+use paca::progress::FileProgress;
 
 pub struct IndicatifProgress {
     bar: ProgressBar,

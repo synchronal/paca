@@ -8,7 +8,7 @@ resolver = "2"
 
 [workspace.dependencies]
 paca-cli = { path = "./paca-cli" }
-paca-core = { path = "./paca-core" }
+paca = { path = "./paca-core" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

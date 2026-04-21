@@ -1,5 +1,5 @@
 [package]
-name = "paca-core"
+name = "paca"
 authors.workspace = true
 description.workspace = true
 edition.workspace = true

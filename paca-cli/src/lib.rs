@@ -9,7 +9,7 @@ use cli::Cli;
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Clean(args) => {
-            let result = paca_core::cache::clean::clean_cache(args.hub_dir)?;
+            let result = paca::cache::clean::clean_cache(args.hub_dir)?;
             if result.removed_files.is_empty() {
                 println!("Cache is clean.");
             } else {
@@ -19,10 +19,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Download(args) => {
-            let manifest = paca_core::download::fetch_manifest(&args.model).await?;
+            let manifest = paca::download::fetch_manifest(&args.model).await?;
             let (_multi, reporters) = progress::build_progress(manifest.files());
-            let paths =
-                paca_core::download::download_model(manifest, args.hub_dir, reporters).await?;
+            let paths = paca::download::download_model(manifest, args.hub_dir, reporters).await?;
             for path in &paths {
                 println!("{}", path.display());
             }
@@ -31,7 +30,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("paca {}", env!("CARGO_PKG_VERSION"));
         }
         cli::Commands::List(args) => {
-            let models = paca_core::cache::list_models(args.hub_dir)?;
+            let models = paca::cache::list_models(args.hub_dir)?;
             if models.is_empty() {
                 println!("No downloaded models found.");
             } else {
@@ -41,7 +40,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Outdated(args) => {
-            let outdated = paca_core::cache::check_outdated_models(args.hub_dir).await?;
+            let outdated = paca::cache::check_outdated_models(args.hub_dir).await?;
             if outdated.is_empty() {
                 println!("All downloaded models are up to date.");
             } else {
@@ -51,7 +50,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Remove(args) => {
-            let result = paca_core::cache::remove::remove_model(&args.target, args.hub_dir)?;
+            let result = paca::cache::remove::remove_model(&args.target, args.hub_dir)?;
             for path in &result.removed_files {
                 println!("{}", path.display());
             }
