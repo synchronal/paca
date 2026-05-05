@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -306,35 +306,57 @@ const PARALLEL_THRESHOLD: u64 = 100 * 1024 * 1024;
 /// Number of concurrent connections per file
 const CHUNK_COUNT: usize = 4;
 
+/// Each chunk gets its own `<final>.partial.<idx>` file so resume can
+/// trust file length — never preallocate, or the size will lie.
 async fn download_file_parallel(
     client: &Client,
     url: &str,
-    path: &Path,
+    final_path: &Path,
     total_size: u64,
     progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
     let chunks = calculate_chunks(total_size, CHUNK_COUNT);
+    let chunk_paths: Vec<PathBuf> = (0..chunks.len())
+        .map(|i| chunk_partial_path(final_path, i))
+        .collect();
 
-    let file = File::create(path).map_err(PacaError::FileWrite)?;
-    file.set_len(total_size).map_err(PacaError::FileWrite)?;
-    drop(file);
+    // Chunk files are the source of truth in parallel mode; a leftover
+    // merged partial from a prior crashed concat would shadow them.
+    let merged = partial_path(final_path);
+    if merged.exists() {
+        fs::remove_file(&merged).map_err(PacaError::FileDelete)?;
+    }
 
     progress.start(0);
 
     let mut set = tokio::task::JoinSet::new();
-
-    for (start, end) in chunks {
+    for (i, &(start, end)) in chunks.iter().enumerate() {
+        let chunk_size = end - start + 1;
+        let path = chunk_paths[i].clone();
+        let existing = fs::metadata(&path).map_or(0, |m| m.len());
+        let resume_from = if existing > chunk_size {
+            fs::remove_file(&path).map_err(PacaError::FileDelete)?;
+            0
+        } else {
+            existing
+        };
+        progress.inc(resume_from);
+        if resume_from >= chunk_size {
+            continue;
+        }
         let client = client.clone();
         let url = url.to_string();
-        let path = path.to_path_buf();
         let bar = Arc::clone(progress);
-
         set.spawn(async move { download_chunk(&client, &url, &path, start, end, &bar).await });
     }
 
     while let Some(result) = set.join_next().await {
         result.expect("chunk download task panicked")?;
     }
+
+    concatenate_chunks(&merged, &chunk_paths)?;
+    verify_file_size(&merged, total_size)?;
+    fs::rename(&merged, final_path).map_err(PacaError::FileWrite)?;
 
     progress.finish();
     Ok(())
@@ -343,51 +365,55 @@ async fn download_file_parallel(
 async fn download_chunk(
     client: &Client,
     url: &str,
-    path: &Path,
-    start: u64,
-    end: u64,
+    chunk_path: &Path,
+    abs_start: u64,
+    abs_end: u64,
     progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
+    let chunk_size = abs_end - abs_start + 1;
     let mut retries: u32 = 0;
-    let mut bytes_written: u64 = 0;
-    let chunk_size = end - start + 1;
+    let mut last_size: u64 = fs::metadata(chunk_path).map_or(0, |m| m.len());
 
     loop {
-        let current_start = start + bytes_written;
-        match attempt_chunk_download(client, url, path, current_start, end, progress).await {
-            Ok(received) => {
-                bytes_written += received;
-                if bytes_written >= chunk_size {
+        if last_size >= chunk_size {
+            return Ok(());
+        }
+        let current_start = abs_start + last_size;
+        let result =
+            attempt_chunk_download(client, url, chunk_path, current_start, abs_end, progress).await;
+        let new_size = fs::metadata(chunk_path).map_or(last_size, |m| m.len());
+
+        match result {
+            Ok(()) => {
+                if new_size >= chunk_size {
                     return Ok(());
                 }
-
-                // Server closed early without delivering the full range.
-                // Treat any progress as a reset for the retry counter.
-                if received > 0 {
+                if new_size > last_size {
                     retries = 0;
                 } else {
                     retries += 1;
                 }
-
                 if retries > MAX_RETRIES {
                     return Err(PacaError::Download(std::io::Error::other(
                         "server closed connection before delivering the full chunk",
                     )));
                 }
-
                 let delay = Duration::from_secs(1u64 << retries.min(30));
                 progress.println(&format!(
-                    "Chunk ended early ({bytes_written}/{chunk_size} bytes). Retrying in {}s (attempt {retries}/{MAX_RETRIES})...",
+                    "Chunk ended early ({new_size}/{chunk_size} bytes). Retrying in {}s (attempt {retries}/{MAX_RETRIES})...",
                     delay.as_secs()
                 ));
                 tokio::time::sleep(delay).await;
             }
             Err(e) if is_retryable(&e) => {
-                retries += 1;
+                if new_size > last_size {
+                    retries = 0;
+                } else {
+                    retries += 1;
+                }
                 if retries > MAX_RETRIES {
                     return Err(e);
                 }
-
                 let delay = retry_delay(&e, retries);
                 progress.println(&format!(
                     "Chunk download error: {e}. Retrying in {}s (attempt {retries}/{MAX_RETRIES})...",
@@ -397,17 +423,19 @@ async fn download_chunk(
             }
             Err(e) => return Err(e),
         }
+
+        last_size = new_size;
     }
 }
 
 async fn attempt_chunk_download(
     client: &Client,
     url: &str,
-    path: &Path,
+    chunk_path: &Path,
     start: u64,
     end: u64,
     progress: &Arc<dyn FileProgress>,
-) -> Result<u64, PacaError> {
+) -> Result<(), PacaError> {
     let response = client
         .get(url)
         .header("Range", format!("bytes={start}-{end}"))
@@ -418,22 +446,21 @@ async fn attempt_chunk_download(
         return Err(PacaError::RateLimited(parse_retry_after(&response)));
     }
 
-    let response = response.error_for_status()?;
+    let mut response = response.error_for_status()?;
 
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(PacaError::RangeNotHonored(response.status().as_u16()));
     }
 
-    let mut response = response;
-
+    // Append + create: each retry resumes from the file's current end, so any
+    // bytes already on disk from a prior attempt are preserved and never
+    // re-requested.
     let mut file = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(PacaError::FileWrite)?;
-    file.seek(std::io::SeekFrom::Start(start))
+        .create(true)
+        .append(true)
+        .open(chunk_path)
         .map_err(PacaError::FileWrite)?;
 
-    let mut bytes_received: u64 = 0;
     while let Some(chunk) = response
         .chunk()
         .await
@@ -441,11 +468,24 @@ async fn attempt_chunk_download(
     {
         file.write_all(&chunk).map_err(PacaError::FileWrite)?;
         progress.inc(chunk.len() as u64);
-        bytes_received += chunk.len() as u64;
     }
 
     file.flush().map_err(PacaError::FileWrite)?;
-    Ok(bytes_received)
+    Ok(())
+}
+
+/// Removes each chunk after copying it so peak disk usage during concat
+/// stays near `total_size` instead of `2 * total_size`.
+fn concatenate_chunks(output: &Path, chunk_paths: &[PathBuf]) -> Result<(), PacaError> {
+    let mut writer = BufWriter::new(File::create(output).map_err(PacaError::FileWrite)?);
+    for path in chunk_paths {
+        let mut reader = File::open(path).map_err(PacaError::FileWrite)?;
+        std::io::copy(&mut reader, &mut writer).map_err(PacaError::FileWrite)?;
+        drop(reader);
+        fs::remove_file(path).map_err(PacaError::FileDelete)?;
+    }
+    writer.flush().map_err(PacaError::FileWrite)?;
+    Ok(())
 }
 
 fn calculate_chunks(total_size: u64, count: usize) -> Vec<(u64, u64)> {
@@ -492,10 +532,30 @@ fn partial_path(final_path: &Path) -> PathBuf {
     final_path.with_file_name(name)
 }
 
-/// Downloads `total_size` bytes from `url` into `<final_path>.partial`, then
-/// atomically renames to `final_path` on success. An interrupted run leaves
-/// only a `.partial` file — never a misleadingly-sized final blob.
+fn chunk_partial_path(final_path: &Path, idx: usize) -> PathBuf {
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".partial.{idx}"));
+    final_path.with_file_name(name)
+}
+
+/// Writes `total_size` bytes from `url` to `final_path`. Crash-safe: an
+/// interrupted run leaves resumable `.partial*` files, never a
+/// misleadingly-sized final blob.
 async fn download_to_blob(
+    client: &Client,
+    url: &str,
+    final_path: &Path,
+    total_size: u64,
+    progress: &Arc<dyn FileProgress>,
+) -> Result<(), PacaError> {
+    if total_size >= PARALLEL_THRESHOLD {
+        download_file_parallel(client, url, final_path, total_size, progress).await
+    } else {
+        download_file_sequential(client, url, final_path, total_size, progress).await
+    }
+}
+
+async fn download_file_sequential(
     client: &Client,
     url: &str,
     final_path: &Path,
@@ -512,12 +572,7 @@ async fn download_to_blob(
         existing
     };
 
-    if resume_from == 0 && total_size >= PARALLEL_THRESHOLD {
-        download_file_parallel(client, url, &partial, total_size, progress).await?;
-    } else {
-        download_file(client, url, &partial, resume_from, progress).await?;
-    }
-
+    download_file(client, url, &partial, resume_from, progress).await?;
     verify_file_size(&partial, total_size)?;
     fs::rename(&partial, final_path).map_err(PacaError::FileWrite)?;
     Ok(())
@@ -550,11 +605,6 @@ mod tests {
         Arc::new(NoopProgress)
     }
 
-    fn preallocated_file(path: &Path, size: u64) {
-        let file = File::create(path).unwrap();
-        file.set_len(size).unwrap();
-    }
-
     #[tokio::test]
     async fn attempt_chunk_download_errs_when_server_returns_200_to_range_request() {
         let server = MockServer::start().await;
@@ -567,7 +617,6 @@ mod tests {
         let client = Client::new();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob");
-        preallocated_file(&path, 64);
         let progress = noop_progress();
 
         let result = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &progress).await;
@@ -579,25 +628,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attempt_chunk_download_returns_bytes_received_on_206() {
+    async fn attempt_chunk_download_appends_body_to_chunk_file_on_206() {
         let server = MockServer::start().await;
         let body = vec![3u8; 32];
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(206).set_body_bytes(body))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(body.clone()))
             .mount(&server)
             .await;
 
         let client = Client::new();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("blob");
-        preallocated_file(&path, 64);
+        let path = dir.path().join("blob.partial.0");
         let progress = noop_progress();
 
-        let bytes = attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &progress)
+        attempt_chunk_download(&client, &server.uri(), &path, 0, 31, &progress)
             .await
             .unwrap();
 
-        assert_eq!(bytes, 32);
+        assert_eq!(fs::read(&path).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn attempt_chunk_download_appends_to_existing_chunk_file() {
+        let server = MockServer::start().await;
+        let body = vec![3u8; 16];
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.partial.0");
+        fs::write(&path, vec![1u8; 16]).unwrap();
+        let progress = noop_progress();
+
+        attempt_chunk_download(&client, &server.uri(), &path, 16, 31, &progress)
+            .await
+            .unwrap();
+
+        let mut expected = vec![1u8; 16];
+        expected.extend_from_slice(&body);
+        assert_eq!(fs::read(&path).unwrap(), expected);
     }
 
     #[tokio::test]
@@ -699,8 +771,7 @@ mod tests {
         let client =
             build_download_client(Duration::from_secs(1), Duration::from_millis(200)).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("blob");
-        preallocated_file(&path, 64);
+        let path = dir.path().join("blob.partial.0");
         let progress = noop_progress();
 
         let started = std::time::Instant::now();
@@ -879,5 +950,251 @@ mod tests {
 
         let target = fs::read_link(&result).unwrap();
         assert_eq!(target.to_str().unwrap(), "../../blobs/hash2");
+    }
+
+    #[test]
+    fn chunk_partial_path_appends_index_suffix() {
+        let blob = PathBuf::from("/tmp/blobs/abc123");
+        assert_eq!(
+            chunk_partial_path(&blob, 0),
+            PathBuf::from("/tmp/blobs/abc123.partial.0")
+        );
+        assert_eq!(
+            chunk_partial_path(&blob, 7),
+            PathBuf::from("/tmp/blobs/abc123.partial.7")
+        );
+    }
+
+    #[test]
+    fn chunk_partial_path_preserves_dots_in_blob_name() {
+        let blob = PathBuf::from("/tmp/blobs/abc.def");
+        assert_eq!(
+            chunk_partial_path(&blob, 2),
+            PathBuf::from("/tmp/blobs/abc.def.partial.2")
+        );
+    }
+
+    fn range_responder(body: Vec<u8>) -> impl Fn(&wiremock::Request) -> ResponseTemplate {
+        move |req: &wiremock::Request| {
+            let body_len = body.len();
+            let range = req.headers.get("range").and_then(|v| v.to_str().ok());
+            match range {
+                Some(spec) if spec.starts_with("bytes=") => {
+                    let r = &spec["bytes=".len()..];
+                    let mut parts = r.splitn(2, '-');
+                    let start: usize = parts.next().unwrap().parse().unwrap();
+                    let end_str = parts.next().unwrap();
+                    let end: usize = if end_str.is_empty() {
+                        body_len.saturating_sub(1)
+                    } else {
+                        end_str.parse().unwrap()
+                    };
+                    if start >= body_len {
+                        return ResponseTemplate::new(416);
+                    }
+                    let end_clamped = end.min(body_len - 1);
+                    let slice = body[start..=end_clamped].to_vec();
+                    ResponseTemplate::new(206).set_body_bytes(slice)
+                }
+                _ => ResponseTemplate::new(200).set_body_bytes(body.clone()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn download_file_parallel_writes_final_blob_and_removes_chunk_partials_on_success() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(range_responder(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        let progress = noop_progress();
+
+        download_file_parallel(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert!(final_path.exists(), "final blob should exist");
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+        for i in 0..CHUNK_COUNT {
+            let chunk = chunk_partial_path(&final_path, i);
+            assert!(!chunk.exists(), "chunk partial {chunk:?} should be removed");
+        }
+        assert!(
+            !partial_path(&final_path).exists(),
+            "merged partial should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_parallel_skips_complete_chunk_partial() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let chunks = calculate_chunks(body.len() as u64, CHUNK_COUNT);
+        let (start0, end0) = chunks[0];
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(range_responder(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        let progress = noop_progress();
+
+        let chunk0_path = chunk_partial_path(&final_path, 0);
+        fs::write(&chunk0_path, &body[start0 as usize..=end0 as usize]).unwrap();
+
+        download_file_parallel(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+
+        let received = server.received_requests().await.unwrap();
+        let chunk0_range_prefix = format!("bytes={start0}-");
+        let requested_chunk0 = received.iter().any(|r| {
+            r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|s| s.starts_with(&chunk0_range_prefix))
+        });
+        assert!(
+            !requested_chunk0,
+            "chunk 0 was already complete; should not be requested again"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_parallel_resumes_undersized_chunk_partial() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let chunks = calculate_chunks(body.len() as u64, CHUNK_COUNT);
+        let (start0, end0) = chunks[0];
+        let chunk0_size = (end0 - start0 + 1) as usize;
+        let half = chunk0_size / 2;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(range_responder(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        let progress = noop_progress();
+
+        let chunk0_path = chunk_partial_path(&final_path, 0);
+        fs::write(&chunk0_path, &body[start0 as usize..start0 as usize + half]).unwrap();
+
+        download_file_parallel(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+
+        let received = server.received_requests().await.unwrap();
+        let resume_start = start0 + half as u64;
+        let expected_resume = format!("bytes={resume_start}-{end0}");
+        let saw_resume = received.iter().any(|r| {
+            r.headers.get("range").and_then(|v| v.to_str().ok()) == Some(expected_resume.as_str())
+        });
+        assert!(
+            saw_resume,
+            "expected a resume range request {expected_resume:?}, saw: {:?}",
+            received
+                .iter()
+                .filter_map(|r| r.headers.get("range").and_then(|v| v.to_str().ok()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_parallel_discards_oversized_chunk_partial() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let chunks = calculate_chunks(body.len() as u64, CHUNK_COUNT);
+        let (start0, end0) = chunks[0];
+        let chunk0_size = (end0 - start0 + 1) as usize;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(range_responder(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        let progress = noop_progress();
+
+        let chunk0_path = chunk_partial_path(&final_path, 0);
+        fs::write(&chunk0_path, vec![0xFFu8; chunk0_size * 2]).unwrap();
+
+        download_file_parallel(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn download_file_parallel_clears_stale_merged_partial() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(range_responder(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        let progress = noop_progress();
+
+        // A previous run crashed mid-concat, leaving a garbage merged partial.
+        fs::write(partial_path(&final_path), vec![0xAAu8; 999]).unwrap();
+
+        download_file_parallel(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), body);
+        assert!(!partial_path(&final_path).exists());
     }
 }

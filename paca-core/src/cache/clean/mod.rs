@@ -81,7 +81,7 @@ fn clean_model_dir(
             let blob_entry = blob_entry.map_err(PacaError::CacheDir)?;
             let blob_name = blob_entry.file_name().to_string_lossy().into_owned();
 
-            let reason = if blob_name.ends_with(".partial") {
+            let reason = if is_partial_blob_filename(&blob_name) {
                 Some(CleanReason::PartialBlob)
             } else if !referenced_blobs.contains(&blob_name) {
                 Some(CleanReason::OrphanedBlob)
@@ -100,6 +100,19 @@ fn clean_model_dir(
     }
 
     Ok(())
+}
+
+/// Recognizes both sequential (`<hash>.partial`) and parallel
+/// (`<hash>.partial.<idx>`) download artifacts. The numeric suffix check
+/// avoids false positives like `<hash>.partialfoo`.
+fn is_partial_blob_filename(name: &str) -> bool {
+    if name.ends_with(".partial") {
+        return true;
+    }
+    if let Some((_, suffix)) = name.rsplit_once(".partial.") {
+        return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+    }
+    false
 }
 
 fn collect_blob_refs_recursive(
@@ -333,6 +346,60 @@ mod tests {
 
         assert_eq!(result.removed_files.len(), 1);
         assert_eq!(result.removed_files[0].reason, CleanReason::PartialBlob);
+    }
+
+    #[test]
+    fn clean_cache_removes_chunked_partial_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+
+        write_blob(&model_dir, "used_hash");
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "used_hash");
+
+        for idx in 0..4 {
+            fs::write(
+                model_dir
+                    .join("blobs")
+                    .join(format!("aborted_hash.partial.{idx}")),
+                vec![0u8; 16],
+            )
+            .unwrap();
+        }
+
+        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
+
+        let partial_reasons: Vec<_> = result
+            .removed_files
+            .iter()
+            .filter(|r| r.reason == CleanReason::PartialBlob)
+            .collect();
+        assert_eq!(partial_reasons.len(), 4);
+
+        for idx in 0..4 {
+            assert!(
+                !model_dir
+                    .join("blobs")
+                    .join(format!("aborted_hash.partial.{idx}"))
+                    .exists()
+            );
+        }
+        assert!(model_dir.join("blobs/used_hash").exists());
+    }
+
+    #[test]
+    fn clean_cache_keeps_blob_with_partial_in_middle_of_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+
+        // A blob hash that happens to contain the substring ".partial" but
+        // isn't actually a partial-download artifact.
+        write_blob(&model_dir, "abc.partialfoo");
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(&model_dir, "commit1", "model.gguf", "abc.partialfoo");
+
+        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
+        assert!(result.removed_files.is_empty());
     }
 
     #[test]
