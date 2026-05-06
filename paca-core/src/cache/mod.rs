@@ -1,7 +1,7 @@
 pub mod clean;
 pub mod remove;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,13 @@ pub struct OutdatedModelInfo {
     pub model_ref: ModelRef,
     pub filename: String,
     pub file_path: PathBuf,
+}
+
+/// A downloaded model tag with the on-disk size of all its files combined.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ModelEntry {
+    pub model_ref: ModelRef,
+    pub size: u64,
 }
 
 /// The HuggingFace Hub cache root, ensured to exist on disk.
@@ -123,9 +130,9 @@ pub(crate) fn model_dir_name(model_ref: &ModelRef) -> String {
 }
 
 /// Lists all downloaded models from the hub directory.
-pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelRef>, PacaError> {
+pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelEntry>, PacaError> {
     let hub = HubLayout::open(hub_dir)?;
-    let mut models = Vec::new();
+    let mut entries = Vec::new();
 
     for entry in fs::read_dir(hub.root()).map_err(PacaError::CacheDir)? {
         let entry = entry.map_err(PacaError::CacheDir)?;
@@ -135,18 +142,18 @@ pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelRef>, PacaError>
             continue;
         }
 
-        collect_snapshot_models(&dir_name, &entry.path(), &mut models)?;
+        collect_snapshot_models(&dir_name, &entry.path(), &mut entries)?;
     }
 
-    models.sort_by_key(ModelRef::to_string);
+    entries.sort_by_key(|entry| entry.model_ref.to_string());
 
-    Ok(models)
+    Ok(entries)
 }
 
 fn collect_snapshot_models(
     dir_name: &str,
     model_dir: &Path,
-    models: &mut Vec<ModelRef>,
+    entries: &mut Vec<ModelEntry>,
 ) -> Result<(), PacaError> {
     let Some((owner, model)) = parse_model_dir_name(dir_name) else {
         return Ok(());
@@ -162,37 +169,35 @@ fn collect_snapshot_models(
         return Ok(());
     }
 
-    for tag in collect_gguf_tags(&snapshot_dir, &model)? {
-        models.push(ModelRef {
-            model: model.clone(),
-            owner: owner.clone(),
-            tag,
+    let mut sizes_by_tag: BTreeMap<String, u64> = BTreeMap::new();
+    collect_gguf_sizes_recursive(&snapshot_dir, &snapshot_dir, &model, &mut sizes_by_tag)?;
+
+    for (tag, size) in sizes_by_tag {
+        entries.push(ModelEntry {
+            model_ref: ModelRef {
+                model: model.clone(),
+                owner: owner.clone(),
+                tag,
+            },
+            size,
         });
     }
 
     Ok(())
 }
 
-fn collect_gguf_tags(dir: &Path, model: &str) -> Result<Vec<String>, PacaError> {
-    let mut tags = Vec::new();
-    collect_gguf_tags_recursive(dir, dir, model, &mut tags)?;
-    tags.sort();
-    tags.dedup();
-    Ok(tags)
-}
-
-fn collect_gguf_tags_recursive(
+fn collect_gguf_sizes_recursive(
     base: &Path,
     dir: &Path,
     model: &str,
-    tags: &mut Vec<String>,
+    sizes: &mut BTreeMap<String, u64>,
 ) -> Result<(), PacaError> {
     for entry in fs::read_dir(dir).map_err(PacaError::CacheDir)? {
         let entry = entry.map_err(PacaError::CacheDir)?;
         let path = entry.path();
 
         if path.is_dir() {
-            collect_gguf_tags_recursive(base, &path, model, tags)?;
+            collect_gguf_sizes_recursive(base, &path, model, sizes)?;
             continue;
         }
 
@@ -207,11 +212,16 @@ fn collect_gguf_tags_recursive(
             .to_string_lossy()
             .into_owned();
 
-        if let Some((subdir, _)) = relative.split_once('/') {
-            tags.push(subdir.to_string());
+        let tag = if let Some((subdir, _)) = relative.split_once('/') {
+            subdir.to_string()
         } else if let Some(derived) = derive_tag(&name, model) {
-            tags.push(derived);
-        }
+            derived
+        } else {
+            continue;
+        };
+
+        let size = fs::metadata(&path).map_err(PacaError::CacheDir)?.len();
+        *sizes.entry(tag).or_insert(0) += size;
     }
     Ok(())
 }
@@ -271,7 +281,8 @@ pub async fn check_outdated_models(
 
     let mut repo_outdated: HashMap<String, bool> = HashMap::new();
 
-    for model_ref in &models {
+    for entry in &models {
+        let model_ref = &entry.model_ref;
         let repo = model_ref.repo();
 
         let is_outdated = if let Some(&cached) = repo_outdated.get(&repo) {
@@ -502,9 +513,10 @@ mod tests {
 
         let result = list_models(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].owner, "owner");
-        assert_eq!(result[0].model, "model-GGUF");
-        assert_eq!(result[0].tag, "Q4");
+        assert_eq!(result[0].model_ref.owner, "owner");
+        assert_eq!(result[0].model_ref.model, "model-GGUF");
+        assert_eq!(result[0].model_ref.tag, "Q4");
+        assert_eq!(result[0].size, 4);
     }
 
     #[test]
@@ -526,8 +538,8 @@ mod tests {
 
         let result = list_models(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].tag, "BF16");
-        assert_eq!(result[1].tag, "Q4_K_M");
+        assert_eq!(result[0].model_ref.tag, "BF16");
+        assert_eq!(result[1].model_ref.tag, "Q4_K_M");
     }
 
     #[test]
@@ -546,6 +558,63 @@ mod tests {
 
         let result = list_models(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].tag, "BF16");
+        assert_eq!(result[0].model_ref.tag, "BF16");
+    }
+
+    #[test]
+    fn list_models_sums_file_sizes_across_shards_in_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("models--owner--model-GGUF");
+        let refs = model_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "commit1").unwrap();
+        let snapshot = model_dir.join("snapshots").join("commit1").join("BF16");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(
+            snapshot.join("model-BF16-00001-of-00002.gguf"),
+            vec![0u8; 100],
+        )
+        .unwrap();
+        fs::write(
+            snapshot.join("model-BF16-00002-of-00002.gguf"),
+            vec![0u8; 250],
+        )
+        .unwrap();
+
+        let result = list_models(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].model_ref.tag, "BF16");
+        assert_eq!(result[0].size, 350);
+    }
+
+    #[test]
+    fn list_models_sums_sizes_per_tag_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("models--owner--model-GGUF");
+        let refs = model_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "commit1").unwrap();
+        let snapshot = model_dir.join("snapshots").join("commit1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("model-Q4_K_M.gguf"), vec![0u8; 42]).unwrap();
+        let bf16_dir = snapshot.join("BF16");
+        fs::create_dir_all(&bf16_dir).unwrap();
+        fs::write(
+            bf16_dir.join("model-BF16-00001-of-00002.gguf"),
+            vec![0u8; 7],
+        )
+        .unwrap();
+        fs::write(
+            bf16_dir.join("model-BF16-00002-of-00002.gguf"),
+            vec![0u8; 8],
+        )
+        .unwrap();
+
+        let result = list_models(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].model_ref.tag, "BF16");
+        assert_eq!(result[0].size, 15);
+        assert_eq!(result[1].model_ref.tag, "Q4_K_M");
+        assert_eq!(result[1].size, 42);
     }
 }

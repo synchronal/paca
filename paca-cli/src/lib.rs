@@ -30,12 +30,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("paca {}", env!("CARGO_PKG_VERSION"));
         }
         cli::Commands::List(args) => {
-            let models = paca::cache::list_models(args.hub_dir)?;
-            if models.is_empty() {
+            let entries = paca::cache::list_models(args.hub_dir)?;
+            if entries.is_empty() {
                 println!("No downloaded models found.");
             } else {
-                for model_ref in &models {
-                    println!("{model_ref}");
+                let rows: Vec<(String, String)> = entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.model_ref.to_string(),
+                            humansize::format_size(e.size, humansize::BINARY),
+                        )
+                    })
+                    .collect();
+                let model_width = rows.iter().map(|(m, _)| m.len()).max().unwrap_or(0);
+                for (model, size) in &rows {
+                    println!("{model:<model_width$}  {size}");
                 }
             }
         }
