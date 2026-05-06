@@ -1,5 +1,7 @@
 # Changelog
 
+## v0.2.0
+
 - Add file size summaries to `list` output.
 
 ## v0.1.2
