@@ -205,6 +205,12 @@ fn collect_gguf_sizes_recursive(
             continue;
         }
 
+        // A dangling symlink (blob deleted, download interrupted) must not
+        // abort the whole listing — `paca clean` is what repairs those.
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+
         let name = entry.file_name().to_string_lossy().into_owned();
         let relative = path
             .strip_prefix(base)
@@ -220,8 +226,7 @@ fn collect_gguf_sizes_recursive(
             continue;
         };
 
-        let size = fs::metadata(&path).map_err(PacaError::CacheDir)?.len();
-        *sizes.entry(tag).or_insert(0) += size;
+        *sizes.entry(tag).or_insert(0) += metadata.len();
     }
     Ok(())
 }
@@ -347,6 +352,7 @@ async fn repo_outdated_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{setup_model_dir, write_blob, write_ref, write_snapshot_symlink};
 
     fn model_ref(s: &str) -> ModelRef {
         s.parse().unwrap()
@@ -517,6 +523,23 @@ mod tests {
         assert_eq!(result[0].model_ref.model, "model-GGUF");
         assert_eq!(result[0].model_ref.tag, "Q4");
         assert_eq!(result[0].size, 4);
+    }
+
+    #[test]
+    fn list_models_skips_broken_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+        write_blob(&model_dir, "hash_q4");
+        write_ref(&model_dir, "commit1");
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "hash_q4");
+        // Blob deleted out from under the snapshot; `clean` repairs this, but
+        // you can't run `clean` if listing blows up first.
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q8.gguf", "missing_hash");
+
+        let result = list_models(Some(dir.path().to_path_buf())).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].model_ref.tag, "Q4");
     }
 
     #[test]
