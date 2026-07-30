@@ -51,7 +51,9 @@ fn clean_model_dir(
     let snapshots_dir = model_dir.join("snapshots");
     let blobs_dir = model_dir.join("blobs");
 
-    let current_commit = fs::read_to_string(model_dir.join("refs").join("main")).ok();
+    let current_commit = fs::read_to_string(model_dir.join("refs").join("main"))
+        .ok()
+        .map(|commit| commit.trim().to_string());
 
     // Remove snapshots not referenced by refs/main.
     if snapshots_dir.is_dir() {
@@ -254,6 +256,24 @@ mod tests {
         );
         let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
         assert!(result.removed_files.is_empty());
+    }
+
+    #[test]
+    fn clean_cache_trims_ref_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+
+        write_blob(&model_dir, "abc123");
+        // Written by hand or by another tool; `list_models` and `remove_tag`
+        // both trim, so `clean` must agree or it deletes the live snapshot.
+        fs::write(model_dir.join("refs").join("main"), "commit1\n").unwrap();
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "abc123");
+
+        let result = clean_cache(Some(dir.path().to_path_buf())).unwrap();
+
+        assert_eq!(result.removed_files, vec![]);
+        assert!(model_dir.join("blobs/abc123").exists());
+        assert!(model_dir.join("snapshots/commit1/model-Q4.gguf").exists());
     }
 
     #[test]
