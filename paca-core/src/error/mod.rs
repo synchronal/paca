@@ -3,9 +3,16 @@ use thiserror::Error;
 /// Errors that can occur during model download operations
 #[derive(Debug, Error)]
 pub enum PacaError {
+    /// An HTTP request failed. Carries the blanket `From<reqwest::Error>`
+    /// so that only the manifest code, which maps explicitly, can produce
+    /// [`PacaError::ManifestFetch`] — a transfer that dies mid-download
+    /// used to inherit the manifest wording and blame the wrong step.
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+
     /// Failed to fetch the model manifest from HuggingFace
     #[error("Failed to fetch manifest: {0}")]
-    ManifestFetch(#[from] reqwest::Error),
+    ManifestFetch(reqwest::Error),
 
     /// Failed to parse the manifest JSON response
     #[error("Failed to parse manifest: {0}")]

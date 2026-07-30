@@ -52,9 +52,15 @@ pub async fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Man
         model_ref.tag
     );
 
-    let response = client.get(&url).send().await?.error_for_status()?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(PacaError::ManifestFetch)?
+        .error_for_status()
+        .map_err(PacaError::ManifestFetch)?;
 
-    let parsed: serde_json::Value = response.json().await?;
+    let parsed: serde_json::Value = response.json().await.map_err(PacaError::ManifestFetch)?;
     let discovered = collect_manifest_files(&parsed);
 
     if discovered.is_empty() {
@@ -115,9 +121,15 @@ async fn fetch_tree_files(
         model_ref.repo()
     );
 
-    let response = client.get(&url).send().await?.error_for_status()?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(PacaError::ManifestFetch)?
+        .error_for_status()
+        .map_err(PacaError::ManifestFetch)?;
 
-    let entries: Vec<TreeEntry> = response.json().await?;
+    let entries: Vec<TreeEntry> = response.json().await.map_err(PacaError::ManifestFetch)?;
 
     let mut gguf_files: Vec<GgufFile> = entries
         .into_iter()

@@ -299,7 +299,12 @@ async fn download_with_resume(
 fn is_retryable(error: &PacaError) -> bool {
     match error {
         PacaError::Download(_) | PacaError::RangeNotHonored(_) | PacaError::RateLimited(_) => true,
-        PacaError::ManifestFetch(e) => e.status().is_none_or(|status| status.is_server_error()),
+        // No status at all means the failure was below HTTP — a connect
+        // error, a read timeout, a dropped body — which is exactly what a
+        // retry is for.
+        PacaError::Http(e) | PacaError::ManifestFetch(e) => {
+            e.status().is_none_or(|status| status.is_server_error())
+        }
         _ => false,
     }
 }
@@ -826,6 +831,37 @@ mod tests {
         let resolved = vec![resolved_file("a.gguf", 100, "truncated")];
 
         assert_eq!(bytes_to_download(&hub, &mr, &resolved).unwrap(), 100);
+    }
+
+    async fn transport_error_from_500() -> PacaError {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.partial");
+
+        attempt_download(&Client::new(), &server.uri(), &path, 0, &noop_progress())
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_blame_the_manifest() {
+        let error = transport_error_from_500().await;
+
+        assert!(matches!(error, PacaError::Http(_)), "got {error:?}");
+        assert!(
+            !error.to_string().contains("manifest"),
+            "a mid-download failure should not mention the manifest: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_errors_from_server_faults_stay_retryable() {
+        assert!(is_retryable(&transport_error_from_500().await));
     }
 
     #[tokio::test]
