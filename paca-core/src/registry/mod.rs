@@ -71,6 +71,29 @@ pub async fn fetch_resolve_info(client: &Client, url: &str) -> Result<ResolveInf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn resolve_info_from(commit: &str, etag: &str) -> Result<ResolveInfo, PacaError> {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-repo-commit", commit)
+                    .insert_header("etag", etag),
+            )
+            .mount(&server)
+            .await;
+
+        fetch_resolve_info(&Client::new(), &server.uri()).await
+    }
+
+    #[tokio::test]
+    async fn fetch_resolve_info_accepts_ordinary_hashes() {
+        let result = resolve_info_from("commit1", "\"abc123\"").await.unwrap();
+        assert_eq!(result.blob_hash, "abc123");
+        assert_eq!(result.commit_hash, "commit1");
+    }
 
     #[test]
     fn default_headers_includes_authorization_when_hf_token_set() {

@@ -9,6 +9,7 @@ use reqwest::Client;
 use crate::cache::{HubLayout, ModelPaths};
 use crate::error::PacaError;
 use crate::model::ModelRef;
+use crate::path::join_within;
 use crate::progress::FileProgress;
 use crate::registry::default_headers;
 use crate::registry::endpoint::model_endpoint;
@@ -65,14 +66,14 @@ pub async fn download_model(
     let endpoint = model_endpoint();
     let head_client = build_resolve_client()?;
 
-    let blobs = hub.model(&model_ref).blobs();
+    let blobs = hub.model(&model_ref)?.blobs();
     fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
 
     // Resolving every file up front is what makes the disk-space check
     // honest: only once the blob hashes are known can already-cached files
     // be excluded from the requirement.
     let resolved = resolve_files(&head_client, endpoint, &model_ref, files, progress).await?;
-    check_disk_space(&blobs, bytes_to_download(&hub, &model_ref, &resolved))?;
+    check_disk_space(&blobs, bytes_to_download(&hub, &model_ref, &resolved)?)?;
 
     let mut set: tokio::task::JoinSet<Result<(PathBuf, String), PacaError>> =
         tokio::task::JoinSet::new();
@@ -97,7 +98,7 @@ pub async fn download_model(
     }
 
     if let Some(commit) = &commit_hash {
-        hub.model(&model_ref).save_ref(commit)?;
+        hub.model(&model_ref)?.save_ref(commit)?;
     }
 
     Ok(paths)
@@ -154,18 +155,24 @@ async fn resolve_files(
 /// Bytes that actually have to be fetched, skipping blobs already on disk
 /// at their expected size. Counting those would make a re-run of an
 /// already-complete download demand the model's full size in free space.
-fn bytes_to_download(hub: &HubLayout, model_ref: &ModelRef, resolved: &[ResolvedFile]) -> u64 {
-    let paths = hub.model(model_ref);
+fn bytes_to_download(
+    hub: &HubLayout,
+    model_ref: &ModelRef,
+    resolved: &[ResolvedFile],
+) -> Result<u64, PacaError> {
+    let paths = hub.model(model_ref)?;
+    let mut needed = 0;
 
-    resolved
-        .iter()
-        .filter(|file| {
-            let existing = fs::metadata(paths.blob(&file.resolve_info.blob_hash))
-                .map_or(0, |metadata| metadata.len());
-            !blob_is_complete(existing, file.gguf_file.size)
-        })
-        .map(|file| file.gguf_file.size)
-        .sum()
+    for file in resolved {
+        let existing = paths
+            .blob(&file.resolve_info.blob_hash)
+            .map(|path| fs::metadata(path).map_or(0, |metadata| metadata.len()))?;
+        if !blob_is_complete(existing, file.gguf_file.size) {
+            needed += file.gguf_file.size;
+        }
+    }
+
+    Ok(needed)
 }
 
 /// Puts one file into the cache: fetches its blob unless a complete copy
@@ -184,8 +191,8 @@ async fn install_file(
         url,
     } = file;
 
-    let paths = hub.model(model_ref);
-    let blob_path = paths.blob(&resolve_info.blob_hash);
+    let paths = hub.model(model_ref)?;
+    let blob_path = paths.blob(&resolve_info.blob_hash)?;
 
     if paths.blob_exists(&resolve_info.blob_hash) {
         let existing_size = fs::metadata(&blob_path).map_or(0, |m| m.len());
@@ -214,18 +221,25 @@ async fn install_file(
 }
 
 fn create_snapshot_symlink(
-    paths: &ModelPaths<'_>,
+    paths: &ModelPaths,
     commit_hash: &str,
     filename: &str,
     blob_hash: &str,
 ) -> Result<PathBuf, PacaError> {
-    let symlink_path = paths.snapshot(commit_hash).join(filename);
+    // The manifest supplies `filename`, so nesting is legitimate but
+    // leaving the snapshot directory is not. Validating the blob path here
+    // too keeps the relative target below honest, even though its own
+    // `join_child` result goes unused.
+    let symlink_path = join_within(&paths.snapshot(commit_hash)?, filename)?;
+    paths.blob(blob_hash)?;
+
     if let Some(parent) = symlink_path.parent() {
         fs::create_dir_all(parent).map_err(PacaError::CacheDir)?;
     }
 
     // Depth: one `..` to escape the commit dir, one per subdir inside it,
-    // and one more to exit `snapshots/`.
+    // and one more to exit `snapshots/`. Sound only because `join_within`
+    // rejected any `..` that would make the slash count lie.
     let depth = filename.matches('/').count() + 2;
     let relative_blob = format!("{}blobs/{blob_hash}", "../".repeat(depth));
 
@@ -413,6 +427,7 @@ async fn download_blob_parallel(
         result.expect("chunk download task panicked")?;
     }
 
+    verify_chunk_sizes(&chunk_paths, &chunks)?;
     concatenate_chunks(&merged, &chunk_paths)?;
     verify_file_size(&merged, total_size)?;
     fs::rename(&merged, final_path).map_err(PacaError::FileWrite)?;
@@ -531,6 +546,36 @@ async fn attempt_chunk_download(
 
     file.flush().map_err(PacaError::FileWrite)?;
     Ok(())
+}
+
+/// Gate in front of [`concatenate_chunks`], which consumes the chunks as
+/// it copies them. Without this check a single bad chunk costs the whole
+/// download: concat would destroy every chunk on its way to a merged file
+/// that then fails verification. Only the mismatched chunks are deleted,
+/// so the next run refetches those ranges and resumes the rest.
+fn verify_chunk_sizes(chunk_paths: &[PathBuf], chunks: &[(u64, u64)]) -> Result<(), PacaError> {
+    let mut mismatch = None;
+
+    for (path, &(start, end)) in chunk_paths.iter().zip(chunks) {
+        let expected = end - start + 1;
+        let Ok(metadata) = fs::metadata(path) else {
+            mismatch.get_or_insert(PacaError::SizeMismatch {
+                actual: 0,
+                expected,
+            });
+            continue;
+        };
+
+        if metadata.len() != expected {
+            fs::remove_file(path).map_err(PacaError::FileDelete)?;
+            mismatch.get_or_insert(PacaError::SizeMismatch {
+                actual: metadata.len(),
+                expected,
+            });
+        }
+    }
+
+    mismatch.map_or(Ok(()), Err)
 }
 
 /// Removes each chunk after copying it so peak disk usage during concat
@@ -751,15 +796,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        fs::create_dir_all(hub.model(&mr).blobs()).unwrap();
-        fs::write(hub.model(&mr).blob("cached"), vec![0u8; 100]).unwrap();
+        fs::create_dir_all(hub.model(&mr).unwrap().blobs()).unwrap();
+        fs::write(
+            hub.model(&mr).unwrap().blob("cached").unwrap(),
+            vec![0u8; 100],
+        )
+        .unwrap();
 
         let resolved = vec![
             resolved_file("a.gguf", 100, "cached"),
             resolved_file("b.gguf", 250, "missing"),
         ];
 
-        assert_eq!(bytes_to_download(&hub, &mr, &resolved), 250);
+        assert_eq!(bytes_to_download(&hub, &mr, &resolved).unwrap(), 250);
     }
 
     #[test]
@@ -767,12 +816,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        fs::create_dir_all(hub.model(&mr).blobs()).unwrap();
-        fs::write(hub.model(&mr).blob("truncated"), vec![0u8; 50]).unwrap();
+        fs::create_dir_all(hub.model(&mr).unwrap().blobs()).unwrap();
+        fs::write(
+            hub.model(&mr).unwrap().blob("truncated").unwrap(),
+            vec![0u8; 50],
+        )
+        .unwrap();
 
         let resolved = vec![resolved_file("a.gguf", 100, "truncated")];
 
-        assert_eq!(bytes_to_download(&hub, &mr, &resolved), 100);
+        assert_eq!(bytes_to_download(&hub, &mr, &resolved).unwrap(), 100);
     }
 
     #[tokio::test]
@@ -1003,9 +1056,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        let paths = hub.model(&mr);
+        let paths = hub.model(&mr).unwrap();
         fs::create_dir_all(paths.blobs()).unwrap();
-        fs::write(paths.blob("abc123hash"), b"fake data").unwrap();
+        fs::write(paths.blob("abc123hash").unwrap(), b"fake data").unwrap();
 
         let result =
             create_snapshot_symlink(&paths, "commitabc", "model-Q4.gguf", "abc123hash").unwrap();
@@ -1020,9 +1073,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr: ModelRef = "owner/model-GGUF:BF16".parse().unwrap();
-        let paths = hub.model(&mr);
+        let paths = hub.model(&mr).unwrap();
         fs::create_dir_all(paths.blobs()).unwrap();
-        fs::write(paths.blob("def456hash"), b"fake data").unwrap();
+        fs::write(paths.blob("def456hash").unwrap(), b"fake data").unwrap();
 
         let result = create_snapshot_symlink(
             &paths,
@@ -1038,14 +1091,31 @@ mod tests {
     }
 
     #[test]
+    fn create_snapshot_symlink_rejects_traversal_in_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        let paths = hub.model(&mr).unwrap();
+        fs::create_dir_all(paths.blobs()).unwrap();
+
+        let result =
+            create_snapshot_symlink(&paths, "commit1", "../../../../evil.gguf", "abc123hash");
+
+        assert!(
+            matches!(result, Err(PacaError::UnsafePath(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
     fn create_snapshot_symlink_replaces_existing_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
-        let paths = hub.model(&mr);
+        let paths = hub.model(&mr).unwrap();
         fs::create_dir_all(paths.blobs()).unwrap();
-        fs::write(paths.blob("hash1"), b"data1").unwrap();
-        fs::write(paths.blob("hash2"), b"data2").unwrap();
+        fs::write(paths.blob("hash1").unwrap(), b"data1").unwrap();
+        fs::write(paths.blob("hash2").unwrap(), b"data2").unwrap();
 
         create_snapshot_symlink(&paths, "commit1", "model.gguf", "hash1").unwrap();
 
@@ -1268,6 +1338,73 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(&final_path).unwrap(), body);
+    }
+
+    /// Honors range requests except the one starting at 0, which gets the
+    /// whole body — the "server ignored my range end" failure mode.
+    fn overshooting_range_responder(
+        body: Vec<u8>,
+    ) -> impl Fn(&wiremock::Request) -> ResponseTemplate {
+        move |req: &wiremock::Request| {
+            let spec = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("bytes=").map(str::to_string))
+                .unwrap_or_default();
+            let mut parts = spec.splitn(2, '-');
+            let start: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            if start == 0 {
+                return ResponseTemplate::new(206).set_body_bytes(body.clone());
+            }
+            let end = parts
+                .next()
+                .and_then(|e| e.parse::<usize>().ok())
+                .unwrap_or(body.len() - 1)
+                .min(body.len() - 1);
+            ResponseTemplate::new(206).set_body_bytes(body[start..=end].to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn download_blob_parallel_keeps_good_chunks_when_one_overshoots() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(overshooting_range_responder(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("abc123");
+        let progress = noop_progress();
+
+        let result = download_blob_parallel(
+            &client,
+            &server.uri(),
+            &final_path,
+            body.len() as u64,
+            &progress,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(PacaError::SizeMismatch { .. })),
+            "got {result:?}"
+        );
+        assert!(!final_path.exists());
+        assert!(!partial_path(&final_path).exists());
+        assert!(
+            !chunk_partial_path(&final_path, 0).exists(),
+            "the overshot chunk should be discarded"
+        );
+        for i in 1..CHUNK_COUNT {
+            assert!(
+                chunk_partial_path(&final_path, i).exists(),
+                "chunk {i} is intact and must survive for resume"
+            );
+        }
     }
 
     #[tokio::test]

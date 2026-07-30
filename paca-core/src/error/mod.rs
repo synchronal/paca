@@ -66,6 +66,10 @@ pub enum PacaError {
     /// Failed to create a symlink
     #[error("Failed to create symlink: {0}")]
     Symlink(std::io::Error),
+
+    /// A value would place a cache path outside the hub directory
+    #[error("Unsafe cache path component: '{0}'")]
+    UnsafePath(String),
 }
 
 /// Errors that can occur while parsing model references

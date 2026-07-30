@@ -9,6 +9,7 @@ use reqwest::Client;
 
 use crate::error::PacaError;
 use crate::model::ModelRef;
+use crate::path::join_child;
 use crate::registry::endpoint::model_endpoint;
 use crate::registry::manifest::fetch_manifest;
 use crate::registry::{build_resolve_client, default_headers, fetch_resolve_info};
@@ -56,23 +57,24 @@ impl HubLayout {
         &self.root
     }
 
-    pub(crate) fn model<'a>(&'a self, model_ref: &'a ModelRef) -> ModelPaths<'a> {
-        ModelPaths {
-            hub: &self.root,
-            model_ref,
-        }
+    /// Fails if `model_ref` would name a directory anywhere other than
+    /// one level below the hub root.
+    pub(crate) fn model(&self, model_ref: &ModelRef) -> Result<ModelPaths, PacaError> {
+        Ok(ModelPaths {
+            dir: join_child(&self.root, &model_dir_name(model_ref))?,
+        })
     }
 }
 
-/// A view over the on-disk layout for a single model reference.
-pub(crate) struct ModelPaths<'a> {
-    hub: &'a Path,
-    model_ref: &'a ModelRef,
+/// A view over the on-disk layout for a single model reference. Holding a
+/// validated `dir` is what lets the derived paths below be infallible.
+pub(crate) struct ModelPaths {
+    dir: PathBuf,
 }
 
-impl ModelPaths<'_> {
+impl ModelPaths {
     pub(crate) fn dir(&self) -> PathBuf {
-        self.hub.join(model_dir_name(self.model_ref))
+        self.dir.clone()
     }
 
     pub(crate) fn blobs(&self) -> PathBuf {
@@ -91,12 +93,14 @@ impl ModelPaths<'_> {
         self.refs().join("main")
     }
 
-    pub(crate) fn blob(&self, hash: &str) -> PathBuf {
-        self.blobs().join(hash)
+    /// Both of these take a registry-supplied hash, so both go through
+    /// [`join_child`] rather than a bare `join`.
+    pub(crate) fn blob(&self, hash: &str) -> Result<PathBuf, PacaError> {
+        join_child(&self.blobs(), hash)
     }
 
-    pub(crate) fn snapshot(&self, commit_hash: &str) -> PathBuf {
-        self.snapshots().join(commit_hash)
+    pub(crate) fn snapshot(&self, commit_hash: &str) -> Result<PathBuf, PacaError> {
+        join_child(&self.snapshots(), commit_hash)
     }
 
     pub(crate) fn save_ref(&self, commit_hash: &str) -> Result<(), PacaError> {
@@ -111,7 +115,7 @@ impl ModelPaths<'_> {
     }
 
     pub(crate) fn blob_exists(&self, blob_hash: &str) -> bool {
-        self.blob(blob_hash).exists()
+        self.blob(blob_hash).is_ok_and(|path| path.exists())
     }
 }
 
@@ -304,9 +308,13 @@ pub async fn check_outdated_models(
         }
 
         let manifest = fetch_manifest(&client, model_ref).await?;
-        let paths = hub.model(model_ref);
-        let local_commit = paths.read_ref();
-        let snapshot_path = paths.snapshot(local_commit.as_deref().unwrap_or(""));
+        let paths = hub.model(model_ref)?;
+        // `list_models` only yields models whose refs/main resolves to a
+        // real snapshot, so the ref is always present here.
+        let Some(local_commit) = paths.read_ref() else {
+            continue;
+        };
+        let snapshot_path = paths.snapshot(local_commit.trim())?;
 
         for gguf_file in &manifest.gguf_files {
             outdated_models.push(OutdatedModelInfo {
@@ -341,7 +349,7 @@ async fn repo_is_outdated(
         first_file.filename
     );
 
-    let local_commit = hub.model(model_ref).read_ref();
+    let local_commit = hub.model(model_ref)?.read_ref();
 
     match fetch_resolve_info(head_client, &url).await {
         Ok(info) => Ok(local_commit.as_deref() != Some(&info.commit_hash)),
@@ -389,7 +397,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr = model_ref("unsloth/GLM-4.7-Flash-GGUF:Q2_K_XL");
-        let paths = hub.model(&mr);
+        let paths = hub.model(&mr).unwrap();
 
         let base = dir.path().join("models--unsloth--GLM-4.7-Flash-GGUF");
         assert_eq!(paths.blobs(), base.join("blobs"));
@@ -404,8 +412,11 @@ mod tests {
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr = model_ref("owner/model-GGUF:Q4");
 
-        hub.model(&mr).save_ref("abc123commit").unwrap();
-        assert_eq!(hub.model(&mr).read_ref().as_deref(), Some("abc123commit"));
+        hub.model(&mr).unwrap().save_ref("abc123commit").unwrap();
+        assert_eq!(
+            hub.model(&mr).unwrap().read_ref().as_deref(),
+            Some("abc123commit")
+        );
     }
 
     #[test]
@@ -413,9 +424,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(
-            hub.model(&model_ref("owner/model-GGUF:Q4")).read_ref(),
+            hub.model(&model_ref("owner/model-GGUF:Q4"))
+                .unwrap()
+                .read_ref(),
             None
         );
+    }
+
+    #[test]
+    fn model_rejects_a_ref_that_escapes_the_hub_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr = ModelRef {
+            model: "../../victim".to_string(),
+            owner: "owner".to_string(),
+            tag: "Q4".to_string(),
+        };
+
+        assert!(matches!(hub.model(&mr), Err(PacaError::UnsafePath(_))));
+    }
+
+    #[test]
+    fn blob_rejects_a_registry_hash_that_escapes_the_blobs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let paths = hub.model(&model_ref("owner/model-GGUF:Q4")).unwrap();
+
+        assert!(matches!(
+            paths.blob("../../../../tmp/evil"),
+            Err(PacaError::UnsafePath(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejects_a_registry_commit_that_escapes_the_snapshots_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let paths = hub.model(&model_ref("owner/model-GGUF:Q4")).unwrap();
+
+        assert!(matches!(
+            paths.snapshot("../evil"),
+            Err(PacaError::UnsafePath(_))
+        ));
     }
 
     #[test]
@@ -423,9 +473,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         let mr = model_ref("owner/model-GGUF:Q4");
-        let paths = hub.model(&mr);
+        let paths = hub.model(&mr).unwrap();
         fs::create_dir_all(paths.blobs()).unwrap();
-        fs::write(paths.blob("abcdef1234"), b"data").unwrap();
+        fs::write(paths.blob("abcdef1234").unwrap(), b"data").unwrap();
 
         assert!(paths.blob_exists("abcdef1234"));
     }
@@ -436,6 +486,7 @@ mod tests {
         let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
         assert!(
             !hub.model(&model_ref("owner/model-GGUF:Q4"))
+                .unwrap()
                 .blob_exists("abcdef1234")
         );
     }

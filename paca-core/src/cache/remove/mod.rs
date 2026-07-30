@@ -6,6 +6,7 @@ use std::str::FromStr;
 use crate::cache::{HubLayout, ModelPaths, derive_tag, is_gguf};
 use crate::error::{ModelRefError, PacaError};
 use crate::model::ModelRef;
+use crate::path::join_child;
 
 /// What to remove from the cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +53,7 @@ pub fn remove_model(target: &str, hub_dir: Option<PathBuf>) -> Result<RemoveResu
 }
 
 fn remove_repo(hub_dir: &Path, owner: &str, model: &str) -> Result<RemoveResult, PacaError> {
-    let model_dir = hub_dir.join(format!("models--{owner}--{model}"));
+    let model_dir = join_child(hub_dir, &format!("models--{owner}--{model}"))?;
     if !model_dir.is_dir() {
         return Err(PacaError::ModelNotInstalled(format!("{owner}/{model}")));
     }
@@ -63,7 +64,7 @@ fn remove_repo(hub_dir: &Path, owner: &str, model: &str) -> Result<RemoveResult,
 }
 
 fn remove_tag(hub: &HubLayout, model_ref: &ModelRef) -> Result<RemoveResult, PacaError> {
-    let paths = hub.model(model_ref);
+    let paths = hub.model(model_ref)?;
     let model_dir = paths.dir();
 
     if !model_dir.is_dir() {
@@ -75,7 +76,7 @@ fn remove_tag(hub: &HubLayout, model_ref: &ModelRef) -> Result<RemoveResult, Pac
         .map(|c| c.trim().to_string())
         .ok_or_else(|| PacaError::ModelNotInstalled(model_ref.to_string()))?;
 
-    let snapshot_dir = paths.snapshot(&commit);
+    let snapshot_dir = paths.snapshot(&commit)?;
     if !snapshot_dir.is_dir() {
         return Err(PacaError::ModelNotInstalled(model_ref.to_string()));
     }
@@ -103,7 +104,7 @@ fn remove_tag(hub: &HubLayout, model_ref: &ModelRef) -> Result<RemoveResult, Pac
 /// snapshot rather than just the current commit keeps older revisions on
 /// disk from being reduced to dangling symlinks.
 fn prune_orphaned_blobs(
-    paths: &ModelPaths<'_>,
+    paths: &ModelPaths,
     removed_files: &mut Vec<PathBuf>,
 ) -> Result<(), PacaError> {
     let mut referenced_blobs: HashSet<String> = HashSet::new();
@@ -280,6 +281,27 @@ mod tests {
     fn parses_target_with_empty_owner_errors() {
         let result: Result<RemoveTarget, _> = "/model".parse();
         assert!(matches!(result, Err(ModelRefError::MissingOwner)));
+    }
+
+    #[test]
+    fn remove_model_rejects_traversal_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = dir.path().join("hub");
+        fs::create_dir_all(&hub).unwrap();
+        // The traversal needs a real directory to pivot through.
+        setup_model_dir(&hub, "owner", "Model");
+
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("important.txt"), b"do not delete").unwrap();
+
+        let result = remove_model("owner/Model/../../victim", Some(hub));
+
+        assert!(
+            matches!(result, Err(PacaError::UnsafePath(_))),
+            "got {result:?}"
+        );
+        assert!(victim.join("important.txt").exists());
     }
 
     #[test]
