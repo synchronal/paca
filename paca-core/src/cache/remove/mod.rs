@@ -90,7 +90,7 @@ fn remove_tag(hub: &HubLayout, model_ref: &ModelRef) -> Result<RemoveResult, Pac
         remove_path_collect(entry, &mut removed_files)?;
     }
 
-    prune_orphaned_blobs(&paths, &snapshot_dir, &mut removed_files)?;
+    prune_orphaned_blobs(&paths, &mut removed_files)?;
 
     if !snapshot_contains_gguf(&snapshot_dir)? {
         remove_path_collect(&model_dir, &mut removed_files)?;
@@ -99,13 +99,18 @@ fn remove_tag(hub: &HubLayout, model_ref: &ModelRef) -> Result<RemoveResult, Pac
     Ok(RemoveResult { removed_files })
 }
 
+/// Deletes blobs no longer reachable from *any* snapshot. Scanning every
+/// snapshot rather than just the current commit keeps older revisions on
+/// disk from being reduced to dangling symlinks.
 fn prune_orphaned_blobs(
     paths: &ModelPaths<'_>,
-    snapshot_dir: &Path,
     removed_files: &mut Vec<PathBuf>,
 ) -> Result<(), PacaError> {
     let mut referenced_blobs: HashSet<String> = HashSet::new();
-    collect_referenced_blob_hashes(snapshot_dir, &mut referenced_blobs)?;
+    let snapshots = paths.snapshots();
+    if snapshots.is_dir() {
+        collect_referenced_blob_hashes(&snapshots, &mut referenced_blobs)?;
+    }
 
     let blobs = paths.blobs();
     if !blobs.is_dir() {
@@ -352,6 +357,31 @@ mod tests {
             !result
                 .removed_files
                 .contains(&model_dir.join("snapshots/commit1/model-Q8.gguf"))
+        );
+    }
+
+    #[test]
+    fn remove_tag_keeps_blobs_of_other_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = setup_model_dir(dir.path(), "owner", "model-GGUF");
+        write_blob(&model_dir, "hash_q4");
+        write_blob(&model_dir, "hash_q8");
+        write_blob(&model_dir, "hash_old");
+        write_ref(&model_dir, "commit2");
+        write_snapshot_symlink(&model_dir, "commit2", "model-Q4.gguf", "hash_q4");
+        write_snapshot_symlink(&model_dir, "commit2", "model-Q8.gguf", "hash_q8");
+        // An older snapshot still on disk, referencing a blob of its own.
+        write_snapshot_symlink(&model_dir, "commit1", "model-Q4.gguf", "hash_old");
+
+        let result = remove_model("owner/model-GGUF:Q4", Some(dir.path().to_path_buf())).unwrap();
+
+        assert!(!model_dir.join("blobs/hash_q4").exists());
+        assert!(model_dir.join("blobs/hash_q8").exists());
+        assert!(model_dir.join("blobs/hash_old").exists());
+        assert!(
+            !result
+                .removed_files
+                .contains(&model_dir.join("blobs/hash_old"))
         );
     }
 
