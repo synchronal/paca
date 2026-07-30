@@ -280,7 +280,7 @@ pub async fn check_outdated_models(
     let hub = HubLayout::open(hub_dir)?;
 
     let client = Client::builder()
-        .default_headers(default_headers())
+        .default_headers(default_headers()?)
         .build()?;
     let head_client = build_resolve_client()?;
     let endpoint = model_endpoint();

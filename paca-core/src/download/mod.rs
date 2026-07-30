@@ -625,7 +625,7 @@ fn build_download_client(
 ) -> Result<Client, PacaError> {
     Ok(Client::builder()
         .connect_timeout(connect_timeout)
-        .default_headers(default_headers())
+        .default_headers(default_headers()?)
         .read_timeout(read_timeout)
         .tcp_keepalive(Duration::from_secs(15))
         .build()?)

@@ -4,7 +4,7 @@ pub mod manifest;
 use std::env;
 
 use reqwest::Client;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::redirect;
 
 use crate::error::PacaError;
@@ -21,24 +21,28 @@ pub struct ResolveInfo {
     pub commit_hash: String,
 }
 
-pub fn default_headers() -> HeaderMap {
+pub fn default_headers() -> Result<HeaderMap, PacaError> {
     let mut headers = HeaderMap::new();
-    headers.insert("User-Agent", USER_AGENT.parse().unwrap());
+    headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
 
-    if let Ok(token) = env::var("HF_TOKEN") {
-        let mut auth_value: reqwest::header::HeaderValue =
-            format!("Bearer {token}").parse().unwrap();
+    let token = env::var("HF_TOKEN").unwrap_or_default();
+    let token = token.trim();
+
+    if !token.is_empty() {
+        let mut auth_value: HeaderValue = format!("Bearer {token}")
+            .parse()
+            .map_err(|_| PacaError::InvalidToken)?;
         auth_value.set_sensitive(true);
         headers.insert("Authorization", auth_value);
     }
 
-    headers
+    Ok(headers)
 }
 
 /// Builds a Client configured for resolve-info HEAD requests (no redirect following).
 pub fn build_resolve_client() -> Result<Client, PacaError> {
     Ok(Client::builder()
-        .default_headers(default_headers())
+        .default_headers(default_headers()?)
         .redirect(redirect::Policy::none())
         .build()?)
 }
@@ -96,9 +100,41 @@ mod tests {
     }
 
     #[test]
+    fn default_headers_trims_whitespace_from_hf_token() {
+        // `docker --env-file` with CRLF endings, a .env loader, `$(cat token)`
+        // — a stray newline should not be fatal.
+        temp_env::with_vars([("HF_TOKEN", Some("test-token-123\r\n"))], || {
+            let headers = default_headers().unwrap();
+            assert_eq!(
+                headers.get("Authorization").unwrap().to_str().unwrap(),
+                "Bearer test-token-123"
+            );
+        });
+    }
+
+    #[test]
+    fn default_headers_ignores_a_blank_hf_token() {
+        temp_env::with_vars([("HF_TOKEN", Some("   "))], || {
+            assert!(default_headers().unwrap().get("Authorization").is_none());
+        });
+    }
+
+    #[test]
+    fn default_headers_errors_on_a_token_that_cannot_be_a_header() {
+        temp_env::with_vars([("HF_TOKEN", Some("abc\ndef"))], || {
+            assert!(matches!(default_headers(), Err(PacaError::InvalidToken)));
+        });
+    }
+
+    #[test]
+    fn invalid_token_error_does_not_leak_the_token() {
+        assert!(!PacaError::InvalidToken.to_string().contains("abc"));
+    }
+
+    #[test]
     fn default_headers_includes_authorization_when_hf_token_set() {
         temp_env::with_vars([("HF_TOKEN", Some("test-token-123"))], || {
-            let headers = default_headers();
+            let headers = default_headers().unwrap();
             assert_eq!(
                 headers.get("Authorization").unwrap().to_str().unwrap(),
                 "Bearer test-token-123"
@@ -109,7 +145,7 @@ mod tests {
     #[test]
     fn default_headers_excludes_authorization_when_hf_token_unset() {
         temp_env::with_vars_unset(["HF_TOKEN"], || {
-            let headers = default_headers();
+            let headers = default_headers().unwrap();
             assert!(headers.get("Authorization").is_none());
         });
     }
@@ -117,7 +153,7 @@ mod tests {
     #[test]
     fn default_headers_includes_user_agent() {
         temp_env::with_vars_unset(["HF_TOKEN"], || {
-            let headers = default_headers();
+            let headers = default_headers().unwrap();
             assert_eq!(
                 headers.get("User-Agent").unwrap().to_str().unwrap(),
                 "llama-cpp"

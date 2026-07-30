@@ -54,6 +54,11 @@ pub enum PacaError {
     #[error("{0}")]
     ModelRef(#[from] ModelRefError),
 
+    /// `HF_TOKEN` cannot be encoded as an HTTP header. Deliberately
+    /// carries no payload: the token is a credential.
+    #[error("HF_TOKEN is not a valid HTTP header value")]
+    InvalidToken,
+
     /// Insufficient disk space for download
     #[error("Insufficient disk space: need {needed} bytes but only {available} bytes available")]
     InsufficientDiskSpace { needed: u64, available: u64 },
