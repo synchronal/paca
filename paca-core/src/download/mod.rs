@@ -13,7 +13,7 @@ use crate::progress::FileProgress;
 use crate::registry::default_headers;
 use crate::registry::endpoint::model_endpoint;
 use crate::registry::manifest::{GgufFile, fetch_manifest as fetch_registry_manifest};
-use crate::registry::{fetch_resolve_info, resolve_client};
+use crate::registry::{ResolveInfo, fetch_resolve_info, resolve_client};
 use crate::sysinfo::check_disk_space;
 
 /// A prepared download manifest: the parsed model ref plus the GGUF
@@ -68,30 +68,21 @@ pub async fn download_model(
     let blobs = hub.model(&model_ref).blobs();
     fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
 
-    let total_size: u64 = files.iter().map(|f| f.size).sum();
-    check_disk_space(&blobs, total_size)?;
+    // Resolving every file up front is what makes the disk-space check
+    // honest: only once the blob hashes are known can already-cached files
+    // be excluded from the requirement.
+    let resolved = resolve_files(&head_client, endpoint, &model_ref, files, progress).await?;
+    check_disk_space(&blobs, bytes_to_download(&hub, &model_ref, &resolved))?;
 
     let mut set: tokio::task::JoinSet<Result<(PathBuf, String), PacaError>> =
         tokio::task::JoinSet::new();
 
-    for (gguf_file, bar) in files.into_iter().zip(progress) {
+    for file in resolved {
         let client = client.clone();
-        let head_client = head_client.clone();
         let model_ref = model_ref.clone();
         let hub = hub.clone();
 
-        set.spawn(async move {
-            download_one_file(
-                &client,
-                &head_client,
-                endpoint,
-                &hub,
-                &model_ref,
-                gguf_file,
-                bar,
-            )
-            .await
-        });
+        set.spawn(async move { install_file(&client, &hub, &model_ref, file).await });
     }
 
     let mut paths = Vec::new();
@@ -112,22 +103,87 @@ pub async fn download_model(
     Ok(paths)
 }
 
-async fn download_one_file(
-    client: &Client,
-    head_client: &Client,
-    endpoint: &str,
-    hub: &HubLayout,
-    model_ref: &ModelRef,
+/// A manifest file with its registry-resolved blob and commit hashes.
+struct ResolvedFile {
     gguf_file: GgufFile,
     progress: Arc<dyn FileProgress>,
-) -> Result<(PathBuf, String), PacaError> {
-    let url = format!(
-        "{endpoint}/{}/resolve/main/{}",
-        model_ref.repo(),
-        gguf_file.filename
-    );
+    resolve_info: ResolveInfo,
+    url: String,
+}
 
-    let resolve_info = fetch_resolve_info(head_client, &url).await?;
+/// Issues the resolve HEAD request for every file concurrently. Results
+/// come back in completion order, which matches how `download_model`
+/// already collects its paths.
+async fn resolve_files(
+    head_client: &Client,
+    endpoint: &str,
+    model_ref: &ModelRef,
+    files: Vec<GgufFile>,
+    progress: Vec<Arc<dyn FileProgress>>,
+) -> Result<Vec<ResolvedFile>, PacaError> {
+    let mut set: tokio::task::JoinSet<Result<ResolvedFile, PacaError>> =
+        tokio::task::JoinSet::new();
+
+    for (gguf_file, bar) in files.into_iter().zip(progress) {
+        let head_client = head_client.clone();
+        let url = format!(
+            "{endpoint}/{}/resolve/main/{}",
+            model_ref.repo(),
+            gguf_file.filename
+        );
+
+        set.spawn(async move {
+            let resolve_info = fetch_resolve_info(&head_client, &url).await?;
+            Ok(ResolvedFile {
+                gguf_file,
+                progress: bar,
+                resolve_info,
+                url,
+            })
+        });
+    }
+
+    let mut resolved = Vec::new();
+    while let Some(result) = set.join_next().await {
+        resolved.push(result.expect("resolve task panicked")?);
+    }
+
+    Ok(resolved)
+}
+
+/// Bytes that actually have to be fetched, skipping blobs already on disk
+/// at their expected size. Counting those would make a re-run of an
+/// already-complete download demand the model's full size in free space.
+fn bytes_to_download(hub: &HubLayout, model_ref: &ModelRef, resolved: &[ResolvedFile]) -> u64 {
+    let paths = hub.model(model_ref);
+
+    resolved
+        .iter()
+        .filter(|file| {
+            let existing = fs::metadata(paths.blob(&file.resolve_info.blob_hash))
+                .map_or(0, |metadata| metadata.len());
+            !blob_is_complete(existing, file.gguf_file.size)
+        })
+        .map(|file| file.gguf_file.size)
+        .sum()
+}
+
+/// Puts one file into the cache: fetches its blob unless a complete copy
+/// is already on disk, then links it into the snapshot tree. Returns the
+/// symlink path and the commit it belongs to.
+async fn install_file(
+    client: &Client,
+    hub: &HubLayout,
+    model_ref: &ModelRef,
+    file: ResolvedFile,
+) -> Result<(PathBuf, String), PacaError> {
+    let ResolvedFile {
+        gguf_file,
+        progress,
+        resolve_info,
+        url,
+    } = file;
+
     let paths = hub.model(model_ref);
     let blob_path = paths.blob(&resolve_info.blob_hash);
 
@@ -670,6 +726,50 @@ mod tests {
         let mut expected = vec![1u8; 16];
         expected.extend_from_slice(&body);
         assert_eq!(fs::read(&path).unwrap(), expected);
+    }
+
+    fn resolved_file(filename: &str, size: u64, blob_hash: &str) -> ResolvedFile {
+        ResolvedFile {
+            gguf_file: GgufFile {
+                filename: filename.to_string(),
+                size,
+            },
+            progress: noop_progress(),
+            resolve_info: ResolveInfo {
+                blob_hash: blob_hash.to_string(),
+                commit_hash: "commit1".to_string(),
+            },
+            url: format!("http://example.test/{filename}"),
+        }
+    }
+
+    #[test]
+    fn bytes_to_download_excludes_complete_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        fs::create_dir_all(hub.model(&mr).blobs()).unwrap();
+        fs::write(hub.model(&mr).blob("cached"), vec![0u8; 100]).unwrap();
+
+        let resolved = vec![
+            resolved_file("a.gguf", 100, "cached"),
+            resolved_file("b.gguf", 250, "missing"),
+        ];
+
+        assert_eq!(bytes_to_download(&hub, &mr, &resolved), 250);
+    }
+
+    #[test]
+    fn bytes_to_download_counts_blob_with_wrong_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr: ModelRef = "owner/model-GGUF:Q4".parse().unwrap();
+        fs::create_dir_all(hub.model(&mr).blobs()).unwrap();
+        fs::write(hub.model(&mr).blob("truncated"), vec![0u8; 50]).unwrap();
+
+        let resolved = vec![resolved_file("a.gguf", 100, "truncated")];
+
+        assert_eq!(bytes_to_download(&hub, &mr, &resolved), 100);
     }
 
     #[tokio::test]
