@@ -6,7 +6,6 @@ use serde::Deserialize;
 use crate::cache::is_gguf;
 use crate::error::PacaError;
 use crate::model::ModelRef;
-use crate::registry::endpoint::model_endpoint;
 
 #[derive(Debug, Deserialize)]
 struct TreeEntry {
@@ -44,8 +43,11 @@ pub struct Manifest {
 }
 
 /// Fetches the model manifest from HuggingFace, handling both single and sharded files
-pub async fn fetch_manifest(client: &Client, model_ref: &ModelRef) -> Result<Manifest, PacaError> {
-    let endpoint = model_endpoint();
+pub async fn fetch_manifest(
+    client: &Client,
+    endpoint: &str,
+    model_ref: &ModelRef,
+) -> Result<Manifest, PacaError> {
     let url = format!(
         "{endpoint}/v2/{}/manifests/{}",
         model_ref.repo(),

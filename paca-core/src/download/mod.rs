@@ -38,7 +38,7 @@ impl ModelManifest {
 pub async fn fetch_manifest(model: &str) -> Result<ModelManifest, PacaError> {
     let model_ref: ModelRef = model.parse()?;
     let client = build_download_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)?;
-    let manifest = fetch_registry_manifest(&client, &model_ref).await?;
+    let manifest = fetch_registry_manifest(&client, model_endpoint(), &model_ref).await?;
     Ok(ModelManifest {
         files: manifest.gguf_files,
         model_ref,

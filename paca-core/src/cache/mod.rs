@@ -11,7 +11,7 @@ use crate::error::PacaError;
 use crate::model::ModelRef;
 use crate::path::join_child;
 use crate::registry::endpoint::model_endpoint;
-use crate::registry::manifest::fetch_manifest;
+use crate::registry::manifest::{GgufFile, fetch_manifest};
 use crate::registry::{build_resolve_client, default_headers, fetch_resolve_info};
 
 /// Information about a model with an outdated commit
@@ -20,6 +20,30 @@ pub struct OutdatedModelInfo {
     pub model_ref: ModelRef,
     pub filename: String,
     pub file_path: PathBuf,
+}
+
+/// A repo whose freshness could not be determined. Reported rather than
+/// swallowed: answering "up to date" for a repo we failed to reach would
+/// present a stale model as current.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct UnreachableRepo {
+    pub reason: String,
+    pub repo: String,
+}
+
+/// The outcome of an outdated check: what is stale, and what could not be
+/// checked at all.
+#[derive(Debug, Default)]
+pub struct OutdatedReport {
+    pub outdated: Vec<OutdatedModelInfo>,
+    pub unreachable: Vec<UnreachableRepo>,
+}
+
+/// A repo's manifest plus whether the local commit has fallen behind.
+#[derive(Clone, Debug)]
+struct RepoStatus {
+    gguf_files: Vec<GgufFile>,
+    is_outdated: bool,
 }
 
 /// A downloaded model tag with the on-disk size of all its files combined.
@@ -274,9 +298,7 @@ fn parse_model_dir_name(dir_name: &str) -> Option<(String, String)> {
 ///
 /// Groups models by repo so that only one resolve-info HEAD request is
 /// made per repo, regardless of how many tags are installed.
-pub async fn check_outdated_models(
-    hub_dir: Option<PathBuf>,
-) -> Result<Vec<OutdatedModelInfo>, PacaError> {
+pub async fn check_outdated_models(hub_dir: Option<PathBuf>) -> Result<OutdatedReport, PacaError> {
     let hub = HubLayout::open(hub_dir)?;
 
     let client = Client::builder()
@@ -284,30 +306,40 @@ pub async fn check_outdated_models(
         .build()?;
     let head_client = build_resolve_client()?;
     let endpoint = model_endpoint();
-    let mut outdated_models = Vec::new();
+    let mut report = OutdatedReport::default();
 
     let models = list_models(Some(hub.root().to_path_buf()))?;
 
-    let mut repo_outdated: HashMap<String, bool> = HashMap::new();
+    // Cached per repo so that N installed tags cost one round trip, and so
+    // that an unreachable repo is reported once rather than N times.
+    let mut checked: HashMap<String, Result<RepoStatus, String>> = HashMap::new();
 
     for entry in &models {
         let model_ref = &entry.model_ref;
         let repo = model_ref.repo();
 
-        let is_outdated = if let Some(&cached) = repo_outdated.get(&repo) {
-            cached
-        } else {
-            let outdated =
-                repo_is_outdated(&client, &head_client, endpoint, &hub, model_ref).await?;
-            repo_outdated.insert(repo, outdated);
-            outdated
-        };
+        if !checked.contains_key(&repo) {
+            let status = fetch_repo_status(&client, &head_client, endpoint, &hub, model_ref)
+                .await
+                .map_err(|error| error.to_string());
 
-        if !is_outdated {
+            if let Err(reason) = &status {
+                report.unreachable.push(UnreachableRepo {
+                    reason: reason.clone(),
+                    repo: repo.clone(),
+                });
+            }
+
+            checked.insert(repo.clone(), status);
+        }
+
+        let Some(Ok(status)) = checked.get(&repo) else {
+            continue;
+        };
+        if !status.is_outdated {
             continue;
         }
 
-        let manifest = fetch_manifest(&client, model_ref).await?;
         let paths = hub.model(model_ref)?;
         // `list_models` only yields models whose refs/main resolves to a
         // real snapshot, so the ref is always present here.
@@ -316,8 +348,8 @@ pub async fn check_outdated_models(
         };
         let snapshot_path = paths.snapshot(local_commit.trim())?;
 
-        for gguf_file in &manifest.gguf_files {
-            outdated_models.push(OutdatedModelInfo {
+        for gguf_file in &status.gguf_files {
+            report.outdated.push(OutdatedModelInfo {
                 model_ref: model_ref.clone(),
                 filename: gguf_file.filename.clone(),
                 file_path: snapshot_path.join(&gguf_file.filename),
@@ -325,21 +357,29 @@ pub async fn check_outdated_models(
         }
     }
 
-    outdated_models.sort_by_key(|a| a.model_ref.to_string());
+    report.outdated.sort_by_key(|a| a.model_ref.to_string());
+    report.unreachable.sort_by(|a, b| a.repo.cmp(&b.repo));
 
-    Ok(outdated_models)
+    Ok(report)
 }
 
-async fn repo_is_outdated(
+/// Fetches a repo's manifest and compares its head commit against the
+/// local ref. Returns the manifest alongside the verdict so the caller
+/// need not refetch it, and propagates every failure so an unreachable
+/// repo is never mistaken for a current one.
+async fn fetch_repo_status(
     client: &Client,
     head_client: &Client,
     endpoint: &str,
     hub: &HubLayout,
     model_ref: &ModelRef,
-) -> Result<bool, PacaError> {
-    let manifest = fetch_manifest(client, model_ref).await?;
+) -> Result<RepoStatus, PacaError> {
+    let manifest = fetch_manifest(client, endpoint, model_ref).await?;
     let Some(first_file) = manifest.gguf_files.first() else {
-        return Ok(false);
+        return Ok(RepoStatus {
+            gguf_files: manifest.gguf_files,
+            is_outdated: false,
+        });
     };
 
     let url = format!(
@@ -349,18 +389,124 @@ async fn repo_is_outdated(
         first_file.filename
     );
 
+    let info = fetch_resolve_info(head_client, &url).await?;
     let local_commit = hub.model(model_ref)?.read_ref();
 
-    match fetch_resolve_info(head_client, &url).await {
-        Ok(info) => Ok(local_commit.as_deref() != Some(&info.commit_hash)),
-        Err(_) => Ok(false),
-    }
+    Ok(RepoStatus {
+        is_outdated: local_commit.as_deref().map(str::trim) != Some(&info.commit_hash),
+        gguf_files: manifest.gguf_files,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{setup_model_dir, write_blob, write_ref, write_snapshot_symlink};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A repo whose manifest loads but whose resolve HEAD fails. Returning
+    /// "up to date" here would report a stale model as current.
+    #[tokio::test]
+    async fn fetch_repo_status_surfaces_an_unreachable_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr = model_ref("owner/model-GGUF:Q4");
+        write_ref(
+            &setup_model_dir(dir.path(), "owner", "model-GGUF"),
+            "commit1",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"ggufFile":{"rfilename":"model-Q4.gguf","size":100}}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let result = fetch_repo_status(&client, &client, &server.uri(), &hub, &mr).await;
+
+        assert!(result.is_err(), "expected an error, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_status_reports_a_differing_commit_as_outdated() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr = model_ref("owner/model-GGUF:Q4");
+        write_ref(
+            &setup_model_dir(dir.path(), "owner", "model-GGUF"),
+            "commit1",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"ggufFile":{"rfilename":"model-Q4.gguf","size":100}}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-repo-commit", "commit2")
+                    .insert_header("etag", "\"blobhash\""),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let status = fetch_repo_status(&client, &client, &server.uri(), &hub, &mr)
+            .await
+            .unwrap();
+
+        assert!(status.is_outdated);
+        assert_eq!(status.gguf_files.len(), 1);
+        assert_eq!(status.gguf_files[0].filename, "model-Q4.gguf");
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_status_reports_a_matching_commit_as_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = HubLayout::open(Some(dir.path().to_path_buf())).unwrap();
+        let mr = model_ref("owner/model-GGUF:Q4");
+        write_ref(
+            &setup_model_dir(dir.path(), "owner", "model-GGUF"),
+            "commit1",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"ggufFile":{"rfilename":"model-Q4.gguf","size":100}}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-repo-commit", "commit1")
+                    .insert_header("etag", "\"blobhash\""),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let status = fetch_repo_status(&client, &client, &server.uri(), &hub, &mr)
+            .await
+            .unwrap();
+
+        assert!(!status.is_outdated);
+    }
 
     fn model_ref(s: &str) -> ModelRef {
         s.parse().unwrap()

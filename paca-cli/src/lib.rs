@@ -50,13 +50,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         cli::Commands::Outdated(args) => {
-            let outdated = paca::cache::check_outdated_models(args.hub_dir).await?;
-            if outdated.is_empty() {
-                println!("All downloaded models are up to date.");
-            } else {
-                for model in &outdated {
+            let report = paca::cache::check_outdated_models(args.hub_dir).await?;
+
+            for repo in &report.unreachable {
+                eprintln!("error: unable to check {}: {}", repo.repo, repo.reason);
+            }
+
+            if !report.outdated.is_empty() {
+                for model in &report.outdated {
                     println!("{}  {}", model.model_ref, model.filename);
                 }
+            } else if report.unreachable.is_empty() {
+                // Only claim everything is current when every repo answered.
+                println!("All downloaded models are up to date.");
             }
         }
         cli::Commands::Remove(args) => {
