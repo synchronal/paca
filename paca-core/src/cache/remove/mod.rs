@@ -80,7 +80,7 @@ fn remove_tag(hub: &HubLayout, model_ref: &ModelRef) -> Result<RemoveResult, Pac
         return Err(PacaError::ModelNotInstalled(model_ref.to_string()));
     }
 
-    let tag_entries = find_tag_entries(&snapshot_dir, &model_ref.model, &model_ref.tag)?;
+    let tag_entries = find_tag_paths(&snapshot_dir, &model_ref.model, &model_ref.tag)?;
     if tag_entries.is_empty() {
         return Err(PacaError::ModelNotInstalled(model_ref.to_string()));
     }
@@ -135,17 +135,13 @@ fn prune_orphaned_blobs(
 /// files nested under a `{tag}/` subdirectory), the subdirectory itself is
 /// returned once so callers can remove the entire shard tree with a single
 /// call.
-fn find_tag_entries(
-    snapshot_dir: &Path,
-    model: &str,
-    tag: &str,
-) -> Result<Vec<PathBuf>, PacaError> {
+fn find_tag_paths(snapshot_dir: &Path, model: &str, tag: &str) -> Result<Vec<PathBuf>, PacaError> {
     let mut entries: Vec<PathBuf> = Vec::new();
-    collect_tag_entries_recursive(snapshot_dir, snapshot_dir, model, tag, &mut entries)?;
+    collect_tag_paths(snapshot_dir, snapshot_dir, model, tag, &mut entries)?;
     Ok(entries)
 }
 
-fn collect_tag_entries_recursive(
+fn collect_tag_paths(
     base: &Path,
     dir: &Path,
     model: &str,
@@ -157,7 +153,7 @@ fn collect_tag_entries_recursive(
         let path = entry.path();
 
         if path.is_dir() {
-            collect_tag_entries_recursive(base, &path, model, tag, entries)?;
+            collect_tag_paths(base, &path, model, tag, entries)?;
             continue;
         }
 

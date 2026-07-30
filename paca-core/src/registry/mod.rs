@@ -36,7 +36,7 @@ pub fn default_headers() -> HeaderMap {
 }
 
 /// Builds a Client configured for resolve-info HEAD requests (no redirect following).
-pub fn resolve_client() -> Result<Client, PacaError> {
+pub fn build_resolve_client() -> Result<Client, PacaError> {
     Ok(Client::builder()
         .default_headers(default_headers())
         .redirect(redirect::Policy::none())

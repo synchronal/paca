@@ -13,7 +13,7 @@ use crate::progress::FileProgress;
 use crate::registry::default_headers;
 use crate::registry::endpoint::model_endpoint;
 use crate::registry::manifest::{GgufFile, fetch_manifest as fetch_registry_manifest};
-use crate::registry::{ResolveInfo, fetch_resolve_info, resolve_client};
+use crate::registry::{ResolveInfo, build_resolve_client, fetch_resolve_info};
 use crate::sysinfo::check_disk_space;
 
 /// A prepared download manifest: the parsed model ref plus the GGUF
@@ -63,7 +63,7 @@ pub async fn download_model(
     let client = build_download_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)?;
     let hub = HubLayout::open(hub_dir)?;
     let endpoint = model_endpoint();
-    let head_client = resolve_client()?;
+    let head_client = build_resolve_client()?;
 
     let blobs = hub.model(&model_ref).blobs();
     fs::create_dir_all(&blobs).map_err(PacaError::CacheDir)?;
@@ -240,7 +240,10 @@ fn create_snapshot_symlink(
 
 const MAX_RETRIES: u32 = 5;
 
-async fn download_file(
+/// Retries a whole-body GET into `path` until it completes, resuming from
+/// `resume_from` and restarting the retry budget whenever an attempt makes
+/// forward progress.
+async fn download_with_resume(
     client: &Client,
     url: &str,
     path: &Path,
@@ -364,14 +367,14 @@ const CHUNK_COUNT: usize = 4;
 
 /// Each chunk gets its own `<final>.partial.<idx>` file so resume can
 /// trust file length — never preallocate, or the size will lie.
-async fn download_file_parallel(
+async fn download_blob_parallel(
     client: &Client,
     url: &str,
     final_path: &Path,
     total_size: u64,
     progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
-    let chunks = calculate_chunks(total_size, CHUNK_COUNT);
+    let chunks = chunk_ranges(total_size, CHUNK_COUNT);
     let chunk_paths: Vec<PathBuf> = (0..chunks.len())
         .map(|i| chunk_partial_path(final_path, i))
         .collect();
@@ -544,7 +547,7 @@ fn concatenate_chunks(output: &Path, chunk_paths: &[PathBuf]) -> Result<(), Paca
     Ok(())
 }
 
-fn calculate_chunks(total_size: u64, count: usize) -> Vec<(u64, u64)> {
+fn chunk_ranges(total_size: u64, count: usize) -> Vec<(u64, u64)> {
     let chunk_size = total_size / count as u64;
     (0..count)
         .map(|i| {
@@ -605,13 +608,13 @@ async fn download_to_blob(
     progress: &Arc<dyn FileProgress>,
 ) -> Result<(), PacaError> {
     if total_size >= PARALLEL_THRESHOLD {
-        download_file_parallel(client, url, final_path, total_size, progress).await
+        download_blob_parallel(client, url, final_path, total_size, progress).await
     } else {
-        download_file_sequential(client, url, final_path, total_size, progress).await
+        download_blob_sequential(client, url, final_path, total_size, progress).await
     }
 }
 
-async fn download_file_sequential(
+async fn download_blob_sequential(
     client: &Client,
     url: &str,
     final_path: &Path,
@@ -628,7 +631,7 @@ async fn download_file_sequential(
         existing
     };
 
-    download_file(client, url, &partial, resume_from, progress).await?;
+    download_with_resume(client, url, &partial, resume_from, progress).await?;
     verify_file_size(&partial, total_size)?;
     fs::rename(&partial, final_path).map_err(PacaError::FileWrite)?;
     Ok(())
@@ -955,8 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn calculate_chunks_divides_evenly() {
-        let chunks = calculate_chunks(100, 4);
+    fn chunk_ranges_divides_evenly() {
+        let chunks = chunk_ranges(100, 4);
         assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0], (0, 24));
         assert_eq!(chunks[1], (25, 49));
@@ -965,8 +968,8 @@ mod tests {
     }
 
     #[test]
-    fn calculate_chunks_last_chunk_absorbs_remainder() {
-        let chunks = calculate_chunks(10, 3);
+    fn chunk_ranges_last_chunk_absorbs_remainder() {
+        let chunks = chunk_ranges(10, 3);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], (0, 2));
         assert_eq!(chunks[1], (3, 5));
@@ -974,16 +977,16 @@ mod tests {
     }
 
     #[test]
-    fn calculate_chunks_covers_entire_file() {
+    fn chunk_ranges_covers_entire_file() {
         let total_size = 1_048_576u64;
-        let chunks = calculate_chunks(total_size, 4);
+        let chunks = chunk_ranges(total_size, 4);
         let total_bytes: u64 = chunks.iter().map(|(start, end)| end - start + 1).sum();
         assert_eq!(total_bytes, total_size);
     }
 
     #[test]
-    fn calculate_chunks_has_no_gaps() {
-        let chunks = calculate_chunks(1000, 4);
+    fn chunk_ranges_has_no_gaps() {
+        let chunks = chunk_ranges(1000, 4);
         for i in 1..chunks.len() {
             assert_eq!(chunks[i].0, chunks[i - 1].1 + 1);
         }
@@ -1102,7 +1105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_file_parallel_writes_final_blob_and_removes_chunk_partials_on_success() {
+    async fn download_blob_parallel_writes_final_blob_and_removes_chunk_partials_on_success() {
         let body: Vec<u8> = (0..64u8).collect();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1115,7 +1118,7 @@ mod tests {
         let final_path = dir.path().join("abc123");
         let progress = noop_progress();
 
-        download_file_parallel(
+        download_blob_parallel(
             &client,
             &server.uri(),
             &final_path,
@@ -1138,9 +1141,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_file_parallel_skips_complete_chunk_partial() {
+    async fn download_blob_parallel_skips_complete_chunk_partial() {
         let body: Vec<u8> = (0..64u8).collect();
-        let chunks = calculate_chunks(body.len() as u64, CHUNK_COUNT);
+        let chunks = chunk_ranges(body.len() as u64, CHUNK_COUNT);
         let (start0, end0) = chunks[0];
 
         let server = MockServer::start().await;
@@ -1157,7 +1160,7 @@ mod tests {
         let chunk0_path = chunk_partial_path(&final_path, 0);
         fs::write(&chunk0_path, &body[start0 as usize..=end0 as usize]).unwrap();
 
-        download_file_parallel(
+        download_blob_parallel(
             &client,
             &server.uri(),
             &final_path,
@@ -1184,9 +1187,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_file_parallel_resumes_undersized_chunk_partial() {
+    async fn download_blob_parallel_resumes_undersized_chunk_partial() {
         let body: Vec<u8> = (0..64u8).collect();
-        let chunks = calculate_chunks(body.len() as u64, CHUNK_COUNT);
+        let chunks = chunk_ranges(body.len() as u64, CHUNK_COUNT);
         let (start0, end0) = chunks[0];
         let chunk0_size = (end0 - start0 + 1) as usize;
         let half = chunk0_size / 2;
@@ -1205,7 +1208,7 @@ mod tests {
         let chunk0_path = chunk_partial_path(&final_path, 0);
         fs::write(&chunk0_path, &body[start0 as usize..start0 as usize + half]).unwrap();
 
-        download_file_parallel(
+        download_blob_parallel(
             &client,
             &server.uri(),
             &final_path,
@@ -1234,9 +1237,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_file_parallel_discards_oversized_chunk_partial() {
+    async fn download_blob_parallel_discards_oversized_chunk_partial() {
         let body: Vec<u8> = (0..64u8).collect();
-        let chunks = calculate_chunks(body.len() as u64, CHUNK_COUNT);
+        let chunks = chunk_ranges(body.len() as u64, CHUNK_COUNT);
         let (start0, end0) = chunks[0];
         let chunk0_size = (end0 - start0 + 1) as usize;
 
@@ -1254,7 +1257,7 @@ mod tests {
         let chunk0_path = chunk_partial_path(&final_path, 0);
         fs::write(&chunk0_path, vec![0xFFu8; chunk0_size * 2]).unwrap();
 
-        download_file_parallel(
+        download_blob_parallel(
             &client,
             &server.uri(),
             &final_path,
@@ -1268,7 +1271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_file_parallel_clears_stale_merged_partial() {
+    async fn download_blob_parallel_clears_stale_merged_partial() {
         let body: Vec<u8> = (0..64u8).collect();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1284,7 +1287,7 @@ mod tests {
         // A previous run crashed mid-concat, leaving a garbage merged partial.
         fs::write(partial_path(&final_path), vec![0xAAu8; 999]).unwrap();
 
-        download_file_parallel(
+        download_blob_parallel(
             &client,
             &server.uri(),
             &final_path,

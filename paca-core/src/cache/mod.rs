@@ -11,7 +11,7 @@ use crate::error::PacaError;
 use crate::model::ModelRef;
 use crate::registry::endpoint::model_endpoint;
 use crate::registry::manifest::fetch_manifest;
-use crate::registry::{default_headers, fetch_resolve_info, resolve_client};
+use crate::registry::{build_resolve_client, default_headers, fetch_resolve_info};
 
 /// Information about a model with an outdated commit
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -142,7 +142,7 @@ pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelEntry>, PacaErro
             continue;
         }
 
-        collect_snapshot_models(&dir_name, &entry.path(), &mut entries)?;
+        collect_model_tags(&dir_name, &entry.path(), &mut entries)?;
     }
 
     entries.sort_by_key(|entry| entry.model_ref.to_string());
@@ -150,7 +150,7 @@ pub fn list_models(hub_dir: Option<PathBuf>) -> Result<Vec<ModelEntry>, PacaErro
     Ok(entries)
 }
 
-fn collect_snapshot_models(
+fn collect_model_tags(
     dir_name: &str,
     model_dir: &Path,
     entries: &mut Vec<ModelEntry>,
@@ -170,7 +170,7 @@ fn collect_snapshot_models(
     }
 
     let mut sizes_by_tag: BTreeMap<String, u64> = BTreeMap::new();
-    collect_gguf_sizes_recursive(&snapshot_dir, &snapshot_dir, &model, &mut sizes_by_tag)?;
+    sum_gguf_sizes_by_tag(&snapshot_dir, &snapshot_dir, &model, &mut sizes_by_tag)?;
 
     for (tag, size) in sizes_by_tag {
         entries.push(ModelEntry {
@@ -186,7 +186,7 @@ fn collect_snapshot_models(
     Ok(())
 }
 
-fn collect_gguf_sizes_recursive(
+fn sum_gguf_sizes_by_tag(
     base: &Path,
     dir: &Path,
     model: &str,
@@ -197,7 +197,7 @@ fn collect_gguf_sizes_recursive(
         let path = entry.path();
 
         if path.is_dir() {
-            collect_gguf_sizes_recursive(base, &path, model, sizes)?;
+            sum_gguf_sizes_by_tag(base, &path, model, sizes)?;
             continue;
         }
 
@@ -278,7 +278,7 @@ pub async fn check_outdated_models(
     let client = Client::builder()
         .default_headers(default_headers())
         .build()?;
-    let head_client = resolve_client()?;
+    let head_client = build_resolve_client()?;
     let endpoint = model_endpoint();
     let mut outdated_models = Vec::new();
 
@@ -294,7 +294,7 @@ pub async fn check_outdated_models(
             cached
         } else {
             let outdated =
-                repo_outdated_check(&client, &head_client, endpoint, &hub, model_ref).await?;
+                repo_is_outdated(&client, &head_client, endpoint, &hub, model_ref).await?;
             repo_outdated.insert(repo, outdated);
             outdated
         };
@@ -322,7 +322,7 @@ pub async fn check_outdated_models(
     Ok(outdated_models)
 }
 
-async fn repo_outdated_check(
+async fn repo_is_outdated(
     client: &Client,
     head_client: &Client,
     endpoint: &str,

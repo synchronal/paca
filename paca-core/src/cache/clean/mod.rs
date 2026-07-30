@@ -62,7 +62,7 @@ fn clean_model_dir(
             let snapshot_name = snapshot_entry.file_name().to_string_lossy().into_owned();
 
             if current_commit.as_deref() != Some(&snapshot_name) {
-                remove_dir_recursive(
+                remove_dir_collect(
                     &snapshot_entry.path(),
                     &CleanReason::OrphanedSnapshot,
                     removed_files,
@@ -74,7 +74,7 @@ fn clean_model_dir(
     // Walk remaining snapshots to collect referenced blob hashes and remove broken symlinks.
     let mut referenced_blobs: HashSet<String> = HashSet::new();
     if snapshots_dir.is_dir() {
-        collect_blob_refs_recursive(&snapshots_dir, &mut referenced_blobs, removed_files)?;
+        collect_blob_refs(&snapshots_dir, &mut referenced_blobs, removed_files)?;
     }
 
     // Remove orphaned blobs and stray .partial files from aborted downloads.
@@ -117,7 +117,9 @@ fn is_partial_blob_filename(name: &str) -> bool {
     false
 }
 
-fn collect_blob_refs_recursive(
+/// Records every blob hash reachable from a snapshot tree, deleting any
+/// symlink it finds pointing at a blob that is gone.
+fn collect_blob_refs(
     dir: &Path,
     referenced_blobs: &mut HashSet<String>,
     removed_files: &mut Vec<RemovedFile>,
@@ -127,7 +129,7 @@ fn collect_blob_refs_recursive(
         let path = entry.path();
 
         if path.is_dir() {
-            collect_blob_refs_recursive(&path, referenced_blobs, removed_files)?;
+            collect_blob_refs(&path, referenced_blobs, removed_files)?;
             continue;
         }
 
@@ -168,7 +170,9 @@ fn collect_blob_refs_recursive(
     Ok(())
 }
 
-fn remove_dir_recursive(
+/// Recursively removes `dir`, recording each *file* deleted (not
+/// directories) into `removed_files` under `reason`.
+fn remove_dir_collect(
     dir: &Path,
     reason: &CleanReason,
     removed_files: &mut Vec<RemovedFile>,
@@ -186,7 +190,7 @@ fn remove_dir_recursive(
                 .is_ok_and(|m| m.file_type().is_symlink());
 
             if path.is_dir() && !is_symlink {
-                remove_dir_recursive(&path, reason, removed_files)?;
+                remove_dir_collect(&path, reason, removed_files)?;
             } else {
                 fs::remove_file(&path).map_err(PacaError::FileDelete)?;
                 removed_files.push(RemovedFile {
